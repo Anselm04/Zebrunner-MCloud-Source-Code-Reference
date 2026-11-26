@@ -1,0 +1,5 @@
+Upstream: https://github.com/zebrunner/mcloud
+Revision: 3f94a710724bcb483e85261a3e389ecadbeb0c11
+Copied files: 86
+Excluded files: 3
+Upstream automation and unsupported entries excluded; original licences retained.

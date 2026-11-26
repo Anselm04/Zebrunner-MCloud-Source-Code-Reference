@@ -1,0 +1,451 @@
+---
+# The services of MCloud: STF, the grid and the nginx in front of them (README.md).
+# The image tags and the ports come from .env, the settings of the services from variables.env:
+# ./zebrunner.sh setup writes both from their *.original files, the variables of the grid from variables.env into
+# grid.env (setup and start).
+networks:
+  default:
+    name: infra
+    external: true
+  # the MDM services and the services of MCloud they talk to (stf-proxy, stf-api), apart from the containers of the
+  # devices of infra (README.md#mdm)
+  mdm:
+    name: mcloud-mdm
+  # the databases of the MDM: no other container, no internet
+  mdm-db:
+    name: mcloud-mdm-db
+    internal: true
+
+# the logs of every service are rotated: the default json-file driver of docker keeps them all (LOG_MAX_SIZE, LOG_MAX_FILE of .env)
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "${LOG_MAX_SIZE:-50m}"
+    max-file: "${LOG_MAX_FILE:-5}"
+
+# the STF units: one image, the settings of variables.env, started after the database migration
+x-stf: &stf
+  image: "public.ecr.aws/zebrunner/stf:${TAG_STF}"
+  env_file:
+    - variables.env
+  # production: the errors answer no stack trace. variables.env has the secrets of other services too: the access token
+  # of the admin (STF_TOKEN: the grid, adb-relay, the MDM), the secret of the grid and the secrets of the sign-ins
+  # (stf-auth only); no STF unit reads them, they are empty here
+  environment: &stf-environment
+    - NODE_ENV=production
+    - STF_TOKEN=
+    - GRID_AUTH_SECRET=
+    - LDAP_BIND_CREDENTIALS=
+    - OAUTH_CLIENT_SECRET=
+    - STF_AUTH_MOCK_BASIC_AUTH_PASSWORD=
+  depends_on:
+    stf-migrate:
+      condition: service_completed_successfully
+  logging: *logging
+  restart: always
+
+# the units with an HTTP port: it accepts connections (docker ps shows an unhealthy unit)
+x-http-healthcheck: &http-healthcheck
+  test: ["CMD", "node", "-e", "require('net').connect(3000, '127.0.0.1').on('connect', () => process.exit(0)).on('error', () => process.exit(1))"]
+  interval: 10s
+  timeout: 5s
+  retries: 3
+  start_period: 60s
+
+# the units without a port: healthy while they are connected (ESTABLISHED) to the ports of their arguments, their
+# ZeroMQ brokers and RethinkDB; ZeroMQ reconnects by itself, a unit without its connections is cut off from STF
+x-connections-script: &connections-script >-
+  const fs = require('fs'); const up = new Set();
+  for (const f of ['/proc/net/tcp', '/proc/net/tcp6']) { try {
+  for (const l of fs.readFileSync(f, 'utf8').split('\n').slice(1)) {
+  const c = l.trim().split(/\s+/); if (c[3] === '01') up.add(parseInt(c[2].split(':').pop(), 16)); } } catch (e) {} }
+  process.exit(process.argv.slice(1).every((p) => up.has(Number(p))) ? 0 : 1)
+x-connections-healthcheck: &connections-healthcheck
+  interval: 10s
+  timeout: 5s
+  retries: 3
+  start_period: 60s
+
+services:
+  stf-proxy:
+    image: "nginx:${TAG_NGINX}"
+    container_name: stf-proxy
+    volumes:
+      - ./configuration/stf-proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./configuration/stf-proxy/ssl:/etc/nginx/ssl:ro
+      # the secret of the grid (README.md#access-to-the-grid), written by ./zebrunner.sh setup and start
+      - ./configuration/stf-proxy/grid-auth.conf:/etc/nginx/grid-auth.conf:ro
+      - ./configuration/stf-proxy/grid:/usr/share/nginx/html/grid:ro
+      # the locations of the MDM (README.md#mdm), written by ./zebrunner.sh with MDM_ENABLED=true
+      - ./configuration/stf-proxy/mdm:/etc/nginx/mdm:ro
+    ports:
+      - "${STF_PORT}:80" # primary HTTP port
+      # the grid of the nodes, the grid of the join string of ./zebrunner.sh node-invite: the registration of Appium only
+      - "${AGENTS_ADDRESS}:4446:4446"
+    networks: [default, mdm]
+    depends_on:
+      stf-app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/127.0.0.1/80"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *logging
+    restart: always
+  # the TCP relay of the remote debug of STF (adb connect) for the nodes in a private network: ./zebrunner.sh starts it
+  # with the profile adb-relay when ADB_RELAY of .env is true (README.md#remote-debug-through-the-adb-relay)
+  adb-relay:
+    image: "nginx:${TAG_NGINX}"
+    container_name: adb-relay
+    profiles: [adb-relay]
+    # it listens on the remote debug ports of the devices on every address of the server, connects to the nodes and
+    # reads the devices of the nodes from stf-proxy on the port of the host: the network of the host instead of published
+    # ports
+    network_mode: host
+    # nginx and the sync of the devices of STF
+    entrypoint: ["bash", "/opt/adb-relay/adb-relay.sh"]
+    environment:
+      - ADB_RELAY=${ADB_RELAY:-false}
+      - ADB_RELAY_PORTS=${ADB_RELAY_PORTS:-}
+      - ADB_RELAY_SYNC_SECONDS=${ADB_RELAY_SYNC_SECONDS:-300}
+      - STF_URL=${STF_URL}
+      - STF_PORT=${STF_PORT}
+    volumes:
+      - ./configuration/adb-relay/nginx.conf:/etc/nginx/nginx.conf:ro
+      # adb-relay.sh, its awk programs and stf-token (STF_TOKEN of variables.env only, written by ./zebrunner.sh)
+      - ./configuration/adb-relay:/opt/adb-relay:ro
+    healthcheck:
+      # nginx writes its pid once it listens on every port of the ranges
+      test: ["CMD", "sh", "-c", "kill -0 $$(cat /run/nginx.pid)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *logging
+    restart: always
+  mcloud-grid:
+    image: "public.ecr.aws/zebrunner/mcloud-grid:${TAG_SELENIUM_HUB}"
+    container_name: mcloud-grid
+    # STF_TOKEN, PLAYWRIGHT_ENABLED and GRID_AUTH_SECRET of variables.env only, written by ./zebrunner.sh setup and
+    # start: the grid gets none of the secrets of STF; optional, so stop and down of a deployment of an earlier MCloud
+    # work without it
+    env_file:
+      - path: grid.env
+        required: false
+    environment:
+      - STF_URL=http://stf-api:3000
+      # 10 min session wait timeout as 20 min is configured on NGiNX
+      - GRID_NEW_SESSION_WAIT_TIMEOUT=600000
+      - CHECK_APPIUM_STATUS=true
+      # the details of the grid in its JSON logs
+      # - MCLOUD_LOG_LEVEL=FINE
+    # not published: the users reach it through /mcloud of stf-proxy, the nodes register through its port 4446
+    # the healthcheck is the one of the image (/grid/api/proxy, it does not ask the nodes)
+    logging: *logging
+    restart: always
+  rethinkdb:
+    image: "rethinkdb:${TAG_RETHINKDB}"
+    container_name: rethinkdb
+    volumes:
+      - "stf-db-volume:/data"
+    command: rethinkdb --bind all --cache-size 8192 --no-update-check --no-http-admin
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/127.0.0.1/28015"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    logging: *logging
+    restart: always
+  # creates and updates the tables (e.g. the sessions of the sign-ins) before the other units start
+  stf-migrate:
+    image: "public.ecr.aws/zebrunner/stf:${TAG_STF}"
+    container_name: stf-migrate
+    env_file:
+      - variables.env
+    environment: *stf-environment
+    command: stf migrate
+    depends_on:
+      rethinkdb:
+        condition: service_healthy
+    logging: *logging
+  stf-app:
+    <<: *stf
+    container_name: stf-app
+    healthcheck: *http-healthcheck
+    command: stf app --port 3000 --auth-url ${STF_URL}/${AUTH_URL} --websocket-url ${STF_URL}/
+  stf-auth:
+    <<: *stf
+    container_name: stf-auth
+    # the sign-in: the secrets of the sign-ins of variables.env (LDAP, OAuth2, the mock sign-in), not the token of the admin
+    environment:
+      - NODE_ENV=production
+      - STF_TOKEN=
+      - GRID_AUTH_SECRET=
+    healthcheck: *http-healthcheck
+    # ${STF_URL}/stf/ with slash at the end produce invalid redirect! /stf/?jwt=e...
+    command: stf ${AUTH_SYSTEM} --port 3000 --app-url ${STF_URL}/stf
+  stf-processor001:
+    <<: *stf
+    container_name: stf-processor001
+    healthcheck:
+      <<: *connections-healthcheck
+      test: ["CMD", "node", "-e", *connections-script, "7160", "7260", "28015"]
+    command: stf processor proc001 --connect-app-dealer tcp://stf-triproxy-app:7160 --connect-dev-dealer tcp://stf-triproxy-dev:7260
+  stf-reaper:
+    <<: *stf
+    container_name: stf-reaper
+    healthcheck:
+      <<: *connections-healthcheck
+      test: ["CMD", "node", "-e", *connections-script, "7150", "7270", "28015"]
+    command: stf reaper reaper001 --connect-push tcp://stf-triproxy-dev:7270 --connect-sub tcp://stf-triproxy-app:7150 --heartbeat-timeout 30000
+  stf-storage-plugin-apk:
+    <<: *stf
+    container_name: stf-storage-plugin-apk
+    healthcheck: *http-healthcheck
+    command: stf storage-plugin-apk --port 3000 --storage-url ${STF_URL}/
+  stf-storage-plugin-image:
+    <<: *stf
+    container_name: stf-storage-plugin-image
+    healthcheck: *http-healthcheck
+    command: stf storage-plugin-image --port 3000 --storage-url ${STF_URL}/
+  # SECRET and STF_STORAGE_TOKEN of variables.env protect the storage routes
+  stf-storage-temp:
+    <<: *stf
+    container_name: stf-storage-temp
+    healthcheck: *http-healthcheck
+    volumes:
+      - "stf-temp-volume:/data"
+    command: stf storage-temp --port 3000 --save-dir /data
+  stf-triproxy-app:
+    <<: *stf
+    container_name: stf-triproxy-app
+    healthcheck:
+      <<: *http-healthcheck
+      test: ["CMD", "node", "-e", "require('net').connect(7160, '127.0.0.1').on('connect', () => process.exit(0)).on('error', () => process.exit(1))"]
+    command: stf triproxy app001 --bind-pub "tcp://*:7150" --bind-dealer "tcp://*:7160" --bind-pull "tcp://*:7170"
+    # the nodes connect to the dealer only; their ZeroMQ ports are on AGENTS_ADDRESS, the host of the join string of
+    # ./zebrunner.sh node-invite
+    ports:
+      - "${AGENTS_ADDRESS}:7160:7160"
+  stf-triproxy-dev:
+    <<: *stf
+    container_name: stf-triproxy-dev
+    healthcheck:
+      <<: *http-healthcheck
+      test: ["CMD", "node", "-e", "require('net').connect(7260, '127.0.0.1').on('connect', () => process.exit(0)).on('error', () => process.exit(1))"]
+    command: stf triproxy dev001 --bind-pub "tcp://*:7250" --bind-dealer "tcp://*:7260" --bind-pull "tcp://*:7270"
+    ports:
+      - "${AGENTS_ADDRESS}:7250:7250"
+      - "${AGENTS_ADDRESS}:7260:7260"
+      - "${AGENTS_ADDRESS}:7270:7270"
+  stf-websocket:
+    <<: *stf
+    container_name: stf-websocket
+    healthcheck: *http-healthcheck
+    command: >-
+      stf websocket --port 3000 --storage-url ${STF_URL}/
+      --connect-sub tcp://stf-triproxy-app:7150 --connect-push tcp://stf-triproxy-app:7170
+  stf-api:
+    <<: *stf
+    container_name: stf-api
+    healthcheck: *http-healthcheck
+    # mcloud-mdm reads the devices of STF (MDM_STF_URL)
+    networks: [default, mdm]
+    # --nodes-connect-*: the ZeroMQ endpoints of the answer of the enrollment, the published ports of the triproxies at
+    # NODES_HOST (the host of the join string); --nodes-stf-url is STF_URL of variables.env, the public URL
+    command: >-
+      stf api --port 3000
+      --connect-sub tcp://stf-triproxy-app:7150 --connect-push tcp://stf-triproxy-app:7170
+      --connect-sub-dev tcp://stf-triproxy-dev:7250 --connect-push-dev tcp://stf-triproxy-dev:7270
+      --nodes-connect-sub tcp://${NODES_HOST}:7250 --nodes-connect-push tcp://${NODES_HOST}:7270
+      --nodes-connect-app-dealer tcp://${NODES_HOST}:7160 --nodes-connect-dev-dealer tcp://${NODES_HOST}:7260
+  stf-api-groups-engine:
+    <<: *stf
+    container_name: stf-api-groups-engine
+    healthcheck:
+      <<: *connections-healthcheck
+      test: ["CMD", "node", "-e", *connections-script, "7150", "7170", "7250", "7270", "28015"]
+    command: >-
+      stf groups-engine
+      --connect-sub tcp://stf-triproxy-app:7150 --connect-push tcp://stf-triproxy-app:7170
+      --connect-sub-dev tcp://stf-triproxy-dev:7250 --connect-push-dev tcp://stf-triproxy-dev:7270
+  # The MDM of the devices (README.md#mdm): ./zebrunner.sh starts the profile mdm when MDM_ENABLED of .env is true and
+  # STF_URL is https; the secrets come from mdm.env, stf-proxy publishes the paths of the devices and of the nodes
+  mcloud-mdm:
+    image: "public.ecr.aws/zebrunner/mcloud-mdm:${TAG_MDM}"
+    container_name: mcloud-mdm
+    profiles: [mdm]
+    env_file:
+      - path: configuration/mdm/env/mcloud-mdm.env
+        required: false
+    environment:
+      - MDM_PUBLIC_URL=${STF_URL}
+      - NANOHUB_URL=http://mcloud-mdm-nanohub:9004
+      - HMDM_URL=http://mcloud-mdm-hmdm:8080
+      - HMDM_MQTT_PORT=${MDM_MQTT_PORT:-31443}
+    volumes:
+      - "mcloud-mdm-data:/data"
+      # the Android agent (configuration/mdm/android/mcloud-mdm-agent.apk), put there by the operator
+      - ./configuration/mdm/android:/android:ro
+    # the admin UI: this server only, an ssh tunnel (MDM_ADMIN_PUBLIC=true publishes it on /mcloud/mdm/ too)
+    ports:
+      - "127.0.0.1:${MDM_ADMIN_PORT:-9101}:8081"
+    networks: [mdm]
+    logging: *logging
+    restart: always
+  # NanoHUB: the MDM server of iOS, its storage in MySQL; it trusts the SCEP CA of mcloud-mdm (the data volume)
+  mcloud-mdm-nanohub:
+    image: "ghcr.io/micromdm/nanohub:${TAG_NANOHUB}"
+    container_name: mcloud-mdm-nanohub
+    profiles: [mdm]
+    env_file:
+      - path: configuration/mdm/env/mcloud-mdm-nanohub.env
+        required: false
+    environment:
+      - NANOHUB_CA=/mdm-data/scep/ca.pem
+      - NANOHUB_STORAGE=mysql
+    volumes:
+      - "mcloud-mdm-data:/mdm-data:ro"
+    # APNs: the internet of mdm
+    networks: [mdm, mdm-db]
+    depends_on:
+      mcloud-mdm-mysql:
+        condition: service_healthy
+      mcloud-mdm:
+        condition: service_healthy
+    logging: *logging
+    restart: always
+  mcloud-mdm-mysql:
+    image: "mysql:${TAG_MDM_MYSQL}"
+    container_name: mcloud-mdm-mysql
+    profiles: [mdm]
+    # the schema of NanoMDM has foreign keys to non-unique keys, refused by default since MySQL 8.4
+    command: ["--restrict-fk-on-non-standard-key=OFF"]
+    env_file:
+      - path: configuration/mdm/env/mcloud-mdm-mysql.env
+        required: false
+    environment:
+      - MYSQL_DATABASE=nanohub
+      - MYSQL_USER=nanohub
+      - MYSQL_RANDOM_ROOT_PASSWORD=yes
+    volumes:
+      - "mcloud-mdm-mysql:/var/lib/mysql"
+      # the schemas of NanoHUB, applied at the first start
+      - ./configuration/mdm/mysql:/docker-entrypoint-initdb.d:ro
+    networks: [mdm-db]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    logging: *logging
+    restart: always
+  # Headwind MDM: the server of the Android agents (amd64 only), plain http and MQTT inside: stf-proxy publishes its
+  # agent paths under /hmdm, mcloud-mdm-mqtt its MQTT over TLS
+  mcloud-mdm-hmdm:
+    image: "headwindmdm/hmdm:${TAG_HMDM}"
+    container_name: mcloud-mdm-hmdm
+    profiles: [mdm]
+    platform: linux/amd64
+    # base.url and secure.enrollment, then the entrypoint of the image
+    entrypoint: ["/bin/sh", "/hmdm-entrypoint.sh"]
+    env_file:
+      - path: configuration/mdm/env/mcloud-mdm-hmdm.env
+        required: false
+    environment:
+      - SQL_HOST=mcloud-mdm-postgres
+      - SQL_BASE=hmdm
+      - SQL_USER=hmdm
+      - PROTOCOL=http
+      - BASE_DOMAIN=mcloud-mdm-hmdm
+      - HMDM_PUBLIC_URL=${STF_URL}/hmdm
+      - ADMIN_EMAIL=admin@mcloud-mdm.local
+      - HMDM_VARIANT=os
+      - HMDM_URL=https://h-mdm.com/files/hmdm-5.41.1-os.war
+      - CLIENT_VERSION=6.40
+    volumes:
+      - ./configuration/mdm/hmdm-entrypoint.sh:/hmdm-entrypoint.sh:ro
+      - "mcloud-mdm-hmdm-work:/usr/local/tomcat/work"
+      - "mcloud-mdm-hmdm-config:/usr/local/tomcat/conf/Catalina/localhost"
+    # the web application of HMDM_URL: the internet of mdm
+    networks: [mdm, mdm-db]
+    depends_on:
+      mcloud-mdm-postgres:
+        condition: service_healthy
+    logging: *logging
+    restart: always
+  mcloud-mdm-postgres:
+    image: "postgres:${TAG_MDM_POSTGRES}"
+    container_name: mcloud-mdm-postgres
+    profiles: [mdm]
+    env_file:
+      - path: configuration/mdm/env/mcloud-mdm-postgres.env
+        required: false
+    environment:
+      - POSTGRES_USER=hmdm
+      - POSTGRES_DB=hmdm
+    volumes:
+      - "mcloud-mdm-postgres:/var/lib/postgresql/data"
+    networks: [mdm-db]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "hmdm"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    logging: *logging
+    restart: always
+  # the password of the admin of Headwind MDM (HMDM_PASSWORD) and the public URLs of its files, at every start
+  mcloud-mdm-hmdm-init:
+    image: "postgres:${TAG_MDM_POSTGRES}"
+    container_name: mcloud-mdm-hmdm-init
+    profiles: [mdm]
+    entrypoint: ["/bin/sh", "/hmdm-init.sh"]
+    env_file:
+      - path: configuration/mdm/env/mcloud-mdm-hmdm-init.env
+        required: false
+    environment:
+      - PGHOST=mcloud-mdm-postgres
+      - PGUSER=hmdm
+      - PGDATABASE=hmdm
+      - HMDM_PUBLIC_URL=${STF_URL}/hmdm
+      # it waits for the web application: the init.sql of its first start would bring the reset of the password back
+      - HMDM_INTERNAL_URL=http://mcloud-mdm-hmdm:8080
+    volumes:
+      - ./configuration/mdm/hmdm-init.sh:/hmdm-init.sh:ro
+    networks: [mdm-db]
+    depends_on:
+      mcloud-mdm-postgres:
+        condition: service_healthy
+    logging: *logging
+    restart: "no"
+  # MQTT over TLS of the Android agents with the certificate of stf-proxy, from MDM_SITE_ADDRESSES only
+  mcloud-mdm-mqtt:
+    image: "nginx:${TAG_NGINX}"
+    container_name: mcloud-mdm-mqtt
+    profiles: [mdm]
+    volumes:
+      - ./configuration/mdm/mqtt.conf:/etc/nginx/nginx.conf:ro
+      - ./configuration/stf-proxy/ssl:/etc/nginx/ssl:ro
+    ports:
+      - "${MDM_MQTT_PORT:-31443}:31443"
+    networks: [mdm]
+    depends_on:
+      - mcloud-mdm-hmdm
+    healthcheck:
+      test: ["CMD", "sh", "-c", "kill -0 $$(cat /run/nginx.pid)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *logging
+    restart: always
+volumes:
+  stf-db-volume:
+  stf-temp-volume:
+  mcloud-mdm-data:
+  mcloud-mdm-mysql:
+  mcloud-mdm-postgres:
+  mcloud-mdm-hmdm-work:
+  mcloud-mdm-hmdm-config:

@@ -1,0 +1,1406 @@
+#!/bin/bash
+# Tests of zebrunner.sh: its commands on a copy of the repository; docker and curl are stubs, docker only records
+# its calls (the services themselves are checked by tests/compose_test.sh).
+source "$(dirname "$0")/lib.sh"
+# shellcheck source=../patch/utility.sh
+source "${REPO}/patch/utility.sh"
+# shellcheck source=../patch/ui.sh
+source "${REPO}/patch/ui.sh"
+
+MCLOUD="${WORK}/mcloud"
+copy_repo "$MCLOUD"
+
+# the stub body is expanded when the stub runs; NO_NETWORK=1: the infra network is missing; `compose ps` prints
+# ${STUB_DIR}/running
+# shellcheck disable=SC2016
+stub docker '(IFS="|"; echo "docker|$*") >> "${STUB_DIR}/calls.log"
+[[ "$1 $2" == "network inspect" && "$NO_NETWORK" == "1" ]] && exit 1
+[[ "$1 $2" == "compose ps" ]] && cat "${STUB_DIR}/running" 2> /dev/null
+# the volume of the database exists with ${STUB_DIR}/db-volume; docker ps: the folder of ${STUB_DIR}/project-dir runs it
+[[ "$1 $2" == "volume inspect" ]] && { [[ -f "${STUB_DIR}/db-volume" ]] || exit 1; }
+[[ "$1" == "ps" ]] && cat "${STUB_DIR}/project-dir" 2> /dev/null
+# docker inspect of stf-proxy: running unless ${STUB_DIR}/proxy-down; docker exec: the ports of ${STUB_DIR}/unreachable fail
+[[ "$1" == "inspect" ]] && { [[ -f "${STUB_DIR}/proxy-down" ]] && echo false || echo true; }
+[[ "$1" == "exec" ]] && grep -qx "${*: -1}" "${STUB_DIR}/unreachable" 2> /dev/null && exit 1
+# compose run of stf-migrate: the migration fails with ${STUB_DIR}/migrate-fails; stf token-add prints the token of
+# ${STUB_DIR}/new-token, without it the STF image has no such command
+if [[ "$1 $2" == "compose run" ]]; then
+  if [[ "$*" == *"token-add"* ]]; then
+    [[ -f "${STUB_DIR}/new-token" ]] || { echo "Unknown argument: token-add"; exit 1; }
+    echo "INF/cli:token-add 1 [*] Access token \"mcloud\" of \"admin@zebrunner.com\" created"
+    echo "token=$(cat "${STUB_DIR}/new-token")"
+  elif [[ -f "${STUB_DIR}/migrate-fails" ]]; then
+    echo "FTL/cli:migrate 1 [*] Migration had an error: connection refused"
+    exit 1
+  fi
+fi
+exit 0'
+# curl: the address of ifconfig.me; the STF API answers ${STUB_DIR}/answer with the status ${STUB_DIR}/status (of
+# ${STUB_DIR}/status.user for /api/v1/user when it exists), the configuration of stdin goes to ${STUB_DIR}/curl.stdin
+# shellcheck disable=SC2016
+stub curl '[[ "$*" == *ifconfig.me* ]] && echo 203.0.113.10 && exit 0
+(IFS="|"; echo "curl|$*") >> "${STUB_DIR}/calls.log"
+cat > "${STUB_DIR}/curl.stdin"
+answer="${STUB_DIR}/answer"
+status="${STUB_DIR}/status"
+[[ "${*: -1}" == */api/v1/devices* && -f "${STUB_DIR}/answer.devices" ]] && answer="${STUB_DIR}/answer.devices"
+[[ "${*: -1}" == */api/v1/user && -f "${STUB_DIR}/status.user" ]] && status="${STUB_DIR}/status.user"
+cat "$answer" 2> /dev/null
+printf "\n%s" "$(cat "$status" 2> /dev/null || echo 000)"'
+
+# docker_calls: the calls of docker but the check of the containers of another folder (docker ps) and the creation of
+# STF_TOKEN (compose run, see token_calls)
+docker_calls() {
+  calls docker | grep -v -e '^ps|' -e '^compose|run|'
+}
+
+# token_calls: the calls of docker that create STF_TOKEN
+token_calls() {
+  calls docker | grep '^compose|run|'
+}
+
+# zbr <stdin text> <zebrunner.sh arguments...>: runs zebrunner.sh of the copy without the user's environment,
+# with the NAME=value items of the zbr_env array
+zbr_env=()
+zbr() {
+  local input="$1"
+  shift
+  printf '%b' "$input" | env -i HOME="${WORK}" PATH="${WORK}/bin:/usr/bin:/bin:/usr/sbin:/sbin" TERM=dumb COLUMNS=80 STUB_DIR="$WORK" \
+    "${zbr_env[@]}" /bin/bash "${MCLOUD}/zebrunner.sh" "$@" 2>&1 | unwrap
+  return "${PIPESTATUS[1]}"
+}
+
+# zbr_end <stdin text> <zebrunner.sh arguments...>: zbr for an input that ends, then "exit <status>"; at most 20
+# seconds (timeout) and 50 lines: a question asked again forever is cut there
+zbr_end() {
+  local input="$1"
+  shift
+  {
+    printf '%b' "$input" | env -i HOME="${WORK}" PATH="${WORK}/bin:/usr/bin:/bin:/usr/sbin:/sbin" TERM=dumb COLUMNS=80 STUB_DIR="$WORK" \
+      "$TIMEOUT" 20 /bin/bash "${MCLOUD}/zebrunner.sh" "$@" 2>&1
+    echo "exit $?"
+  } | unwrap | head -n 50
+}
+TIMEOUT="$(command -v timeout || command -v gtimeout)"
+
+# mode <file>: the permissions of a file of the copy, as ls shows them (-rw-------)
+mode() {
+  # shellcheck disable=SC2012 # one known file, ls is the same on Linux and macOS
+  ls -l "${MCLOUD}/$1" | cut -c1-10
+}
+
+# inode <file>: the inode of a file of the copy, the bind mount of a file sees a file written in place only
+inode() {
+  # shellcheck disable=SC2012 # one known file, ls is the same on Linux and macOS
+  ls -i "${MCLOUD}/$1" | awk '{print $1}'
+}
+
+# value <file> <name>: the value of a variable of an env file of the copy
+value() {
+  sed -n "s/^$2=//p" "${MCLOUD}/$1"
+}
+
+# sha256_of <file>: the SHA-256 of a file, independent of the one of zebrunner.sh
+sha256_of() {
+  python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$1"
+}
+
+# curve_keys: ok when variables.env has the CURVE keys of a new deployment, 64 hex characters, the public key of the
+# triproxies the one of their secret key (X25519 of patch/curve_keygen.py, the check of the keys of openssl too)
+curve_keys() {
+  local public
+  local secret
+  local units
+  public="$(value variables.env STF_ZMQ_CURVE_SERVER_PUBLIC_KEY)"
+  secret="$(value variables.env STF_ZMQ_CURVE_SERVER_SECRET_KEY)"
+  units="$(value variables.env STF_ZMQ_CURVE_SECRET_KEY)"
+  if [[ "$secret" =~ ^[0-9a-f]{64}$ && "$units" =~ ^[0-9a-f]{64}$ && "$units" != "$secret" &&
+    "public=${public}" == "$(printf '%s\n' "$secret" | python3 "${REPO}/patch/curve_keygen.py" - | head -1)" ]]; then
+    echo ok
+  fi
+}
+
+# the answers of the interactive setup: protocol, host, port, confirmation, admin name, admin email, confirmation,
+# the sign-in of the previous setup, no start of the services
+answers() {
+  printf '%s\n' "$1" "$2" "$3" y "$4" "$5" y "" n
+}
+
+# certificate <directory> <host>: a self-signed certificate and its key as ssl.crt and ssl.key of the directory
+certificate() {
+  mkdir -p "$1"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=$2" -keyout "$1/ssl.key" -out "$1/ssl.crt" > /dev/null 2>&1
+}
+
+# badge <title>: a title of patch/ui.sh without colors
+badge() {
+  printf '[ %s ]' "$1"
+}
+
+section "help"
+output="$(zbr "" --help)"
+check "--help succeeds" "0" "$?"
+check "-h is --help" "$output" "$(zbr "" -h)"
+check_contains "help starts with the banner of MCloud and its version" \
+  "[ ZEBRUNNER ] MCloud" "$(sed -n 2p <<< "$output")"
+check_contains "the banner shows the version of MCloud" "$(sed -n 's/^TAG_STF=//p' "${REPO}/.env.original")" "$(sed -n 2p <<< "$output")"
+check_contains "help shows the usage" "> ./zebrunner.sh <command> [options]" "$output"
+for group in "SET UP" RUN MAINTAIN NODES HELP OPTIONS; do
+  check_contains "help groups the commands: ${group}" "  $(badge "$group")" "$output"
+done
+for command in setup start stop restart down shutdown backup restore version doctor node-invite nodes help completion "--help,"; do
+  check_contains "help lists ${command}" $'\n'"   ${command} " "$output"
+done
+check "the commands are in their groups" "SET UP setup RUN start stop restart down MAINTAIN backup restore shutdown version doctor NODES node-invite nodes nodes nodes nodes HELP help completion OPTIONS --help," \
+  "$(sed -n -e 's/^  \[ \(.*\) \]$/\1/p' -e 's/^   \([^ ][^ ]*\).*/\1/p' <<< "$output" | tr '\n' ' ' | sed 's/ $//')"
+for subcommand in "[list]" "check <label>" "revoke <label>" "delete <label>"; do
+  check_contains "help lists nodes ${subcommand}" "   nodes       ${subcommand} " "$output"
+done
+check_contains "help shows the arguments of node-invite" "   node-invite <label> <address> [<minutes>]" "$output"
+check_contains "help ends with the telegram channel" "For more help join telegram channel: https://t.me/zebrunner" "$(tail -1 <<< "$output")"
+check "help is ASCII without a UTF-8 locale" "" "$(LC_ALL=C grep -n '[^ -~]' <<< "$output")"
+check "help is --help" "$output" "$(zbr "" help)"
+zbr "" > /dev/null
+check "no command fails as before" "1" "$?"
+check "no command shows the help" "$output" "$(zbr "")"
+output="$(zbr "" unknown)"
+check "an unknown command fails with 2" "2" "$?"
+check_contains "an unknown command is named" "| Unknown command 'unknown'." "$output"
+check_contains "an unknown command shows the usage" "> ./zebrunner.sh <command> [options]" "$output"
+check_not_contains "an unknown command does not show the whole help" "[ SET UP ]" "$output"
+check "an unknown command calls no tool" "" "$(calls docker)$(calls curl)"
+for typo in "strat:'start'" "Setup:'setup'" "nodess:'nodes'" "node:'node-invite' or 'nodes'" "res:'restart' or 'restore'" \
+  "versions:'version'" "--hlep:'--help'"; do
+  check_contains "the command closest to ${typo%%:*}" "| Unknown command '${typo%%:*}'. Did you mean ${typo#*:}?" \
+    "$(zbr "" "${typo%%:*}")"
+done
+check_contains "no command is close to xyz" "| Unknown command 'xyz'."$'\n' "$(zbr "" xyz)"
+check_contains "an unknown command is shown without the escapes of the terminal" "| Unknown command 'a[31mb'." \
+  "$(zbr "" "$(printf 'a\033[31mb')")"
+check_contains "a long unknown command is cut: a pasted secret is not shown whole" \
+  "| Unknown command 'mcloud-join://mcloud.example.com...'." "$(zbr "" "mcloud-join://mcloud.example.com:443?token=mci1.secret")"
+check_not_contains "a long unknown command is cut before its end" "mci1.secret" \
+  "$(zbr "" "mcloud-join://mcloud.example.com:443?token=mci1.secret")"
+
+section "help of a command"
+for command in setup start stop restart down shutdown backup restore version doctor node-invite nodes help completion; do
+  output="$(zbr "" help "$command")"
+  check "help ${command} succeeds" "0" "$?"
+  check_contains "help ${command} shows its usage" "> ./zebrunner.sh ${command}" "$(sed -n 2p <<< "$output")"
+  check "${command} --help is help ${command}" "$output" "$(zbr "" "$command" --help)"
+  check "${command} -h is help ${command}" "$output" "$(zbr "" "$command" -h)"
+  check "help ${command} is ASCII without a UTF-8 locale" "" "$(LC_ALL=C grep -n '[^ -~]' <<< "$output")"
+done
+check_contains "help node-invite explains its arguments" "   <minutes>                       The validity of the invite, 1-1440 minutes," \
+  "$(zbr "" help node-invite)"
+check_contains "help nodes explains its subcommands" "   revoke      <label>             The revocation of a node" "$(zbr "" help nodes)"
+check "the help of a subcommand is the one of nodes" "$(zbr "" help nodes)" "$(zbr "" nodes check --help)"
+output="$(zbr "" help strat)"
+check "help of an unknown command fails with 2" "2" "$?"
+check_contains "help of an unknown command shows the closest one" "| Unknown command 'strat'. Did you mean 'start'?" "$output"
+reset_calls
+zbr "" setup --help > /dev/null
+check "setup --help asks nothing and writes nothing" "no:no:" \
+  "$([[ -e "${MCLOUD}/.env" ]] && echo yes || echo no):$([[ -e "${MCLOUD}/variables.env" ]] && echo yes || echo no):$(calls docker)$(calls curl)"
+zbr_env=(ZBR_INSTALLER=1)
+zbr "" setup -h > /dev/null
+zbr_env=()
+check "setup -h of Zebrunner CE writes nothing" "no" "$([[ -e "${MCLOUD}/.env" ]] && echo yes || echo no)"
+for command in start stop restart down backup restore doctor node-invite nodes; do
+  zbr "" "$command" --help > /dev/null
+  check "${command} --help runs nothing" "0:" "$?:$(calls docker)$(calls curl)"
+done
+
+section "setup"
+output="$(zbr "$(answers "" mcloud.example.com "" "" "")" setup)"
+check "the setup with the defaults succeeds" "0" "$?"
+check "https is the default protocol, 443 the default port" "https://mcloud.example.com:443" "$(value .env STF_URL)"
+check "STF_PORT 443 by default" "443" "$(value .env STF_PORT)"
+check_contains "the missing certificate of the default https is reported" "https needs the certificate of mcloud.example.com" "$output"
+# the other checks: http, the answers of the user
+output="$(zbr "$(answers http mcloud.example.com 80 "" "")" setup)"
+check "the setup succeeds" "0" "$?"
+check_not_contains "the change of the protocol is not a change by hand of nginx.conf" "nginx.conf.previous" "$output"
+check "the change of the protocol keeps no nginx.conf.previous" "no" \
+  "$([[ -e "${MCLOUD}/configuration/stf-proxy/nginx.conf.previous" ]] && echo yes || echo no)"
+check "STF_URL of .env" "http://mcloud.example.com:80" "$(value .env STF_URL)"
+check "STF_PORT of .env" "80" "$(value .env STF_PORT)"
+check "the mock sign-in" "auth-mock" "$(value .env AUTH_SYSTEM)"
+check "the image tags of .env.original" "$(grep '^TAG_' "${REPO}/.env.original")" "$(grep '^TAG_' "${MCLOUD}/.env")"
+check "STF_URL of variables.env" "http://mcloud.example.com:80" "$(value variables.env STF_URL)"
+secret="$(value variables.env SECRET)"
+storage_token="$(value variables.env STF_STORAGE_TOKEN)"
+check "a new SECRET is generated" "48" "${#secret}"
+check "STF_STORAGE_TOKEN is generated" "64" "${#storage_token}"
+check "the admin name" "admin" "$(value variables.env STF_ADMIN_NAME)"
+check "the admin email" "admin@zebrunner.com" "$(value variables.env STF_ADMIN_EMAIL)"
+check "no Zebrunner sign-in" "" "$(value variables.env ZEBRUNNER_LOGIN_URL)"
+check "variables.env ends with a newline" "" "$(tail -c 1 "${MCLOUD}/variables.env")"
+check_contains "the enrollment of the nodes is explained" "./zebrunner.sh node-invite <label> <address>" "$output"
+check "the mock sign-in by default" "auth-mock:auth/mock/" "$(value .env AUTH_SYSTEM):$(value .env AUTH_URL)"
+check_not_contains "no device host is asked" "Device hosts" "$output"
+for name in AGENT_HOSTS ADB_RELAY_HOSTS; do
+  check "no ${name} in .env" "" "$(grep "^${name}=" "${MCLOUD}/.env")"
+done
+for name in NODE_REGISTRATION_TOKEN STF_ZMQ_CURVE_CLIENT_KEYS; do
+  check "no ${name} in variables.env" "" "$(grep "^${name}=" "${MCLOUD}/variables.env")"
+done
+check_contains "AGENTS_ADDRESS 0.0.0.0 is reported" \
+  "AGENTS_ADDRESS of .env is 0.0.0.0: the nodes reach MCloud at mcloud.example.com (the host of STF_URL" "$output"
+check "no access token for adb-relay without its auto mode" "" "$(cat "${MCLOUD}/configuration/adb-relay/stf-token")"
+check "the token file of adb-relay is readable for its owner only" "-rw-------" "$(mode configuration/adb-relay/stf-token)"
+check_not_contains "no warning of the optional adb relay" "ADB_RELAY" "$output"
+check "the mock sign-in is behind the basic authentication" "true" "$(value variables.env STF_AUTH_MOCK_USE_BASIC_AUTH)"
+check "the user of the basic authentication" "'mcloud'" "$(value variables.env STF_AUTH_MOCK_BASIC_AUTH_USERNAME)"
+mock_password="$(value variables.env STF_AUTH_MOCK_BASIC_AUTH_PASSWORD)"
+check "the password of the basic authentication is generated" "26" "${#mock_password}"
+check_contains "the password of the sign-in is shown" "the password ${mock_password}" "$output"
+check "the nginx configuration is the original one for http" "same" \
+  "$(cmp -s "${MCLOUD}/configuration/stf-proxy/nginx.conf" "${REPO}/configuration/stf-proxy/nginx.conf.original" && echo same)"
+check "the checksum of the nginx configuration is stored" "$(sha256_of "${MCLOUD}/configuration/stf-proxy/nginx.conf")" \
+  "$(cat "${MCLOUD}/configuration/stf-proxy/nginx.conf.sha256")"
+check_contains "the settings are saved" 'ZBR_HOSTNAME="mcloud.example.com"' "$(cat "${MCLOUD}/backup/settings.env")"
+check_not_contains "the CURVE keys need no docker" "run|" "$(calls docker)"
+keys="$(printf '%064d' 0)"
+check "the CURVE keys of the triproxies and of the STF units" "ok" "$(curve_keys)"
+server_secret="$(value variables.env STF_ZMQ_CURVE_SERVER_SECRET_KEY)"
+password="$(value variables.env RETHINKDB_ENV_AUTHKEY)"
+check "the password of RethinkDB is generated" "48" "${#password}"
+check "variables.env is readable for its owner only" "-rw-------" "$(mode variables.env)"
+check "backup/settings.env is readable for its owner only" "-rw-------" "$(mode backup/settings.env)"
+check_contains ".env is readable" "-rw-r" "$(mode .env)"
+check "the ports of the device hosts are published on every address" "0.0.0.0" "$(value .env AGENTS_ADDRESS)"
+check "the nodes reach the host of STF_URL" "mcloud.example.com" "$(value .env NODES_HOST)"
+check "the triproxies and the storage read the nodes from stf-api" "http://stf-api:3000" \
+  "$(value variables.env STF_NODES_API_URL)"
+check_contains "the start is suggested" "need to be started after setup" "$output"
+check_contains "the setup starts with the banner of MCloud" "[ ZEBRUNNER ] MCloud" "$(sed -n 2p <<< "$output")"
+check "the phases of the setup" "$(badge SETTINGS) 1/3|$(badge FILES) 2/3|$(badge "NEXT STEPS") 3/3" \
+  "$(grep '^  \[ .* --* [0-9]' <<< "$output" | sed -e 's/^  //' -e 's/ -* / /' | paste -sd '|' -)"
+check_contains "the written files are reported" "   ok   .env and variables.env are written" "$output"
+check_contains "a warning is a callout" $'\n\n  | WARNING\n  | AGENTS_ADDRESS of .env is 0.0.0.0' "$output"
+check_not_contains "no WARNING! prefix" "WARNING!" "$output"
+check "the lines of the setup fit 80 columns" "" \
+  "$(answers http mcloud.example.com 80 "" "" | env -i HOME="${WORK}" PATH="${WORK}/bin:/usr/bin:/bin:/usr/sbin:/sbin" TERM=dumb \
+    COLUMNS=80 STUB_DIR="$WORK" /bin/bash "${MCLOUD}/zebrunner.sh" setup 2>&1 | awk 'length($0) > 80')"
+check "the Playwright sessions are off by default" "false" "$(value variables.env PLAYWRIGHT_ENABLED)"
+grid_secret="$(value variables.env GRID_AUTH_SECRET)"
+check "the secret of the grid is generated" "48" "${#grid_secret}"
+check "the grid gets STF_TOKEN, PLAYWRIGHT_ENABLED and GRID_AUTH_SECRET of variables.env only" "STF_TOKEN=
+PLAYWRIGHT_ENABLED=false
+GRID_AUTH_SECRET=${grid_secret}" "$(grep -v '^#' "${MCLOUD}/grid.env")"
+check "grid.env is readable for its owner only" "-rw-------" "$(mode grid.env)"
+check "stf-proxy gets the secret of the grid" "map \"\" \$grid_auth_secret {
+  default \"${grid_secret}\";
+}" "$(grep -v '^#' "${MCLOUD}/configuration/stf-proxy/grid-auth.conf")"
+check "the secret of stf-proxy is readable for its owner only" "-rw-------" "$(mode configuration/stf-proxy/grid-auth.conf)"
+
+section "setup again"
+replace "${MCLOUD}/variables.env" "STF_TOKEN=" "STF_TOKEN=api-token"
+replace "${MCLOUD}/variables.env" "PLAYWRIGHT_ENABLED=false" "PLAYWRIGHT_ENABLED=true"
+printf '%s\n' "STF_SESSION_TTL_SECONDS=3600" "STF_CUSTOM_KEY=${keys//0/a}" >> "${MCLOUD}/variables.env"
+replace "${MCLOUD}/.env" "AGENTS_ADDRESS=0.0.0.0" "AGENTS_ADDRESS=10.0.0.5"
+replace "${MCLOUD}/.env" "LOG_MAX_SIZE=50m" "LOG_MAX_SIZE=200m"
+# the changes by hand of variables.env and .env, also of the variables the setup does not ask
+replace "${MCLOUD}/variables.env" "STF_AUTH_MOCK_USE_BASIC_AUTH=true" "STF_AUTH_MOCK_USE_BASIC_AUTH=false"
+replace "${MCLOUD}/variables.env" "STF_NODES_API_URL=http://stf-api:3000" "STF_NODES_API_URL=http://stf-api-2:3000"
+replace "${MCLOUD}/variables.env" "RETHINKDB_PORT_28015_TCP=tcp://rethinkdb:28015" "RETHINKDB_PORT_28015_TCP=tcp://db.example.com:28015"
+replace "${MCLOUD}/variables.env" "STF_ADMIN_NAME=admin" "STF_ADMIN_NAME=ops"
+replace "${MCLOUD}/variables.env" "STF_ROOT_GROUP_NAME=MCloud" "STF_ROOT_GROUP_NAME='Mobile Lab'"
+replace "${MCLOUD}/.env" "TAG_STF=" "TAG_STF=old-"
+printf '%s\n' "COMPOSE_PROJECT_NAME=mcloud-prod" "AGENT_HOSTS=192.0.2.5" >> "${MCLOUD}/.env"
+reset_calls
+output="$(zbr "$(answers "" "" 8082 "" ops@example.com)" setup)"
+check "the setup again calls no docker" "" "$(calls docker)"
+check "the password of RethinkDB is kept" "$password" "$(value variables.env RETHINKDB_ENV_AUTHKEY)"
+check "the CURVE keys are kept" "$server_secret" "$(value variables.env STF_ZMQ_CURVE_SERVER_SECRET_KEY)"
+check "a variable added to variables.env is kept" "3600" "$(value variables.env STF_SESSION_TTL_SECONDS)"
+check "another variable added to variables.env is kept" "${keys//0/a}" "$(value variables.env STF_CUSTOM_KEY)"
+check "the address of the ports of the device hosts is kept" "10.0.0.5" "$(value .env AGENTS_ADDRESS)"
+check "the nodes reach AGENTS_ADDRESS" "10.0.0.5" "$(value .env NODES_HOST)"
+check_not_contains "no warning with the LAN address in AGENTS_ADDRESS" "AGENTS_ADDRESS of .env is 0.0.0.0" "$output"
+check "the size of the log files is kept" "200m" "$(value .env LOG_MAX_SIZE)"
+check "the default number of the log files" "5" "$(value .env LOG_MAX_FILE)"
+check "the previous host is the default" "http://mcloud.example.com:8082" "$(value .env STF_URL)"
+check "the new port" "8082" "$(value .env STF_PORT)"
+check "SECRET is kept" "$secret" "$(value variables.env SECRET)"
+check "STF_STORAGE_TOKEN is kept" "$storage_token" "$(value variables.env STF_STORAGE_TOKEN)"
+check "STF_TOKEN is kept" "api-token" "$(value variables.env STF_TOKEN)"
+check "GRID_AUTH_SECRET is kept" "$grid_secret" "$(value variables.env GRID_AUTH_SECRET)"
+check "the Playwright sessions stay on" "true" "$(value variables.env PLAYWRIGHT_ENABLED)"
+check "the option of the Playwright sessions is in variables.env once" "1" "$(grep -c '^PLAYWRIGHT_ENABLED=' "${MCLOUD}/variables.env")"
+check "the grid gets the kept STF_TOKEN, PLAYWRIGHT_ENABLED and GRID_AUTH_SECRET" "STF_TOKEN=api-token
+PLAYWRIGHT_ENABLED=true
+GRID_AUTH_SECRET=${grid_secret}" "$(grep -v '^#' "${MCLOUD}/grid.env")"
+check "the new admin email" "ops@example.com" "$(value variables.env STF_ADMIN_EMAIL)"
+check "the admin name changed in variables.env is kept" "ops" "$(value variables.env STF_ADMIN_NAME)"
+check_contains "the admin name of variables.env is the default of the question" \
+  "Zebrunner MCloud admin username: ops; email: ops@example.com" "$output"
+check "STF_AUTH_MOCK_USE_BASIC_AUTH is kept" "false" "$(value variables.env STF_AUTH_MOCK_USE_BASIC_AUTH)"
+check "STF_NODES_API_URL is kept" "http://stf-api-2:3000" "$(value variables.env STF_NODES_API_URL)"
+check "RETHINKDB_PORT_28015_TCP is kept" "tcp://db.example.com:28015" "$(value variables.env RETHINKDB_PORT_28015_TCP)"
+check "a value with a space is kept in quotes" "'Mobile Lab'" "$(value variables.env STF_ROOT_GROUP_NAME)"
+check "COMPOSE_PROJECT_NAME of .env is kept" "mcloud-prod" "$(value .env COMPOSE_PROJECT_NAME)"
+check "a variable of an earlier MCloud is not kept in .env" "" "$(value .env AGENT_HOSTS)"
+check "the image tags are the ones of .env.original" "$(grep '^TAG_' "${REPO}/.env.original")" "$(grep '^TAG_' "${MCLOUD}/.env")"
+check "every variable of .env.original is in .env once" "" \
+  "$(sed -n 's/^\([A-Z_]*\)=.*/\1/p' "${MCLOUD}/.env" | sort | uniq -d)"
+
+check "the password of the sign-in is kept" "$mock_password" "$(value variables.env STF_AUTH_MOCK_BASIC_AUTH_PASSWORD)"
+
+replace "${MCLOUD}/variables.env" "SECRET=${secret}" "SECRET=password"
+zbr "$(answers "" "" "" "" "")" setup > /dev/null
+secret="$(value variables.env SECRET)"
+check "the placeholder SECRET is generated" "48" "${#secret}"
+replace "${MCLOUD}/variables.env" "SECRET=${secret}" "SECRET="
+zbr "$(answers "" "" "" "" "")" setup > /dev/null
+secret="$(value variables.env SECRET)"
+check "an empty SECRET is generated" "48" "${#secret}"
+check "the added variables are added once" "1" "$(grep -c '^STF_CUSTOM_KEY=' "${MCLOUD}/variables.env")"
+check "the values are kept by every setup" "false 'Mobile Lab' ops mcloud-prod" \
+  "$(value variables.env STF_AUTH_MOCK_USE_BASIC_AUTH) $(value variables.env STF_ROOT_GROUP_NAME) $(value variables.env STF_ADMIN_NAME) $(value .env COMPOSE_PROJECT_NAME)"
+# the defaults again for the next sections
+replace "${MCLOUD}/variables.env" "STF_AUTH_MOCK_USE_BASIC_AUTH=false" "STF_AUTH_MOCK_USE_BASIC_AUTH=true"
+replace "${MCLOUD}/variables.env" "STF_NODES_API_URL=http://stf-api-2:3000" "STF_NODES_API_URL=http://stf-api:3000"
+replace "${MCLOUD}/variables.env" "RETHINKDB_PORT_28015_TCP=tcp://db.example.com:28015" "RETHINKDB_PORT_28015_TCP=tcp://rethinkdb:28015"
+replace "${MCLOUD}/variables.env" "STF_ADMIN_NAME=ops" "STF_ADMIN_NAME=admin"
+replace "${MCLOUD}/variables.env" "STF_ROOT_GROUP_NAME='Mobile Lab'" "STF_ROOT_GROUP_NAME=MCloud"
+sed -i.orig '/^COMPOSE_PROJECT_NAME=/d' "${MCLOUD}/.env"
+
+section "access to the grid"
+conf="${MCLOUD}/configuration/stf-proxy/nginx.conf"
+check_contains "stf-proxy asks stf-api about the hub" "auth_request /_hub_auth/hub;" "$(cat "$conf")"
+check_not_contains "no basic authentication of the grid" "auth_basic" "$(cat "$conf")"
+reset_calls
+output="$(zbr "" start)"
+check "start does not reload an unchanged stf-proxy" "" "$(calls docker | grep '^exec|stf-proxy')"
+check_not_contains "start does not refuse the configuration of stf-proxy" "nginx.conf is the one of an earlier MCloud" "$output"
+# a changed GRID_AUTH_SECRET reaches the grid and stf-proxy at the next start
+set_line "${MCLOUD}/variables.env" "GRID_AUTH_SECRET=${grid_secret//0/1}x"
+reset_calls
+zbr "" start > /dev/null
+check "start gives the grid the changed secret" "GRID_AUTH_SECRET=${grid_secret//0/1}x" "$(grep '^GRID_AUTH_SECRET=' "${MCLOUD}/grid.env")"
+check_contains "start gives stf-proxy the changed secret" "default \"${grid_secret//0/1}x\";" \
+  "$(cat "${MCLOUD}/configuration/stf-proxy/grid-auth.conf")"
+check "start reloads stf-proxy for the changed secret" "exec|stf-proxy|nginx|-s|reload" "$(calls docker | grep '^exec|stf-proxy')"
+set_line "${MCLOUD}/variables.env" "GRID_AUTH_SECRET=${grid_secret}"
+zbr "" start > /dev/null
+# a variables.env of an earlier MCloud has no GRID_AUTH_SECRET: start makes it
+sed -i.orig '/^GRID_AUTH_SECRET=/d' "${MCLOUD}/variables.env"
+zbr "" start > /dev/null
+new_secret="$(value variables.env GRID_AUTH_SECRET)"
+check "start makes the missing secret of the grid" "48" "${#new_secret}"
+check "start gives the grid the new secret" "GRID_AUTH_SECRET=${new_secret}" "$(grep '^GRID_AUTH_SECRET=' "${MCLOUD}/grid.env")"
+set_line "${MCLOUD}/variables.env" "GRID_AUTH_SECRET=${grid_secret}"
+# a nginx.conf of an earlier MCloud does not send the users to the grid: nothing starts until the setup
+cp "$conf" "${WORK}/nginx.conf.new"
+grep -v '_hub_auth' "${WORK}/nginx.conf.new" > "$conf"
+reset_calls
+output="$(zbr "" start)"
+check "start fails with the configuration of stf-proxy of an earlier MCloud" "1" "$?"
+check_contains "start tells to run the setup" "nginx.conf is the one of an earlier MCloud" "$output"
+check "start starts no service with it" "" "$(calls docker | grep '^compose')"
+cp "${WORK}/nginx.conf.new" "$conf"
+mkdir -p "${MCLOUD}/configuration/stf-proxy/htpasswd"
+echo 'user:x' > "${MCLOUD}/configuration/stf-proxy/htpasswd/mcloud.htpasswd"
+output="$(zbr "" start)"
+check_contains "start warns about the htpasswd file of an earlier MCloud" "mcloud.htpasswd is not used any more" "$output"
+check "the grid has the authentication with the new configuration" "GRID_AUTH_SECRET=${grid_secret}" "$(grep '^GRID_AUTH_SECRET=' "${MCLOUD}/grid.env")"
+rm -rf "${MCLOUD}/configuration/stf-proxy/htpasswd"
+replace "$conf" "frame-ancestors 'self'" "frame-ancestors 'self' https://reporting.example.com"
+output="$(zbr "$(answers "" "" "" "" "")" setup)"
+check_contains "a configuration changed by hand is reported" "the previous one is configuration/stf-proxy/nginx.conf.previous" "$output"
+check_contains "a configuration changed by hand is kept aside" "https://reporting.example.com" "$(cat "${conf}.previous")"
+check_not_contains "the new configuration is the original one" "https://reporting.example.com" "$(cat "$conf")"
+rm -f "${conf}.previous"
+output="$(zbr "$(answers "" "" "" "" "")" setup)"
+check_not_contains "an unchanged configuration is not reported" "nginx.conf.previous" "$output"
+check "an unchanged configuration is not kept aside" "no" "$([[ -e "${conf}.previous" ]] && echo yes || echo no)"
+# an upgrade: a new nginx.conf.original is not a change by hand
+cp "${MCLOUD}/configuration/stf-proxy/nginx.conf.original" "${WORK}/nginx.conf.original"
+printf '# a comment of a new release\n' >> "${MCLOUD}/configuration/stf-proxy/nginx.conf.original"
+output="$(zbr "$(answers "" "" "" "" "")" setup)"
+check_not_contains "a new nginx.conf.original is not reported" "nginx.conf.previous" "$output"
+check "a new nginx.conf.original keeps no nginx.conf.previous" "no" "$([[ -e "${conf}.previous" ]] && echo yes || echo no)"
+check_contains "the configuration of the new nginx.conf.original is written" "# a comment of a new release" "$(cat "$conf")"
+cp "${WORK}/nginx.conf.original" "${MCLOUD}/configuration/stf-proxy/nginx.conf.original"
+zbr "$(answers "" "" "" "" "")" setup > /dev/null
+# the first setup after the upgrade from a release without the checksum: the configuration the setup writes for http or
+# https is not a change by hand, another one is (the one of an earlier nginx.conf.original too)
+rm -f "${conf}.sha256"
+sed -e 's/listen 80/listen 80 ssl/' -e 's/#    ssl_/    ssl_/' "${MCLOUD}/configuration/stf-proxy/nginx.conf.original" > "$conf"
+output="$(zbr "$(answers "" "" "" "" "")" setup)"
+check_not_contains "without the checksum the configuration of the other protocol is not reported" "nginx.conf.previous" "$output"
+check "without the checksum the configuration of the other protocol is not kept aside" "no" \
+  "$([[ -e "${conf}.previous" ]] && echo yes || echo no)"
+check "the setup without the checksum stores it" "$(sha256_of "$conf")" "$(cat "${conf}.sha256")"
+rm -f "${conf}.sha256"
+grep -v 'frame-ancestors' "${MCLOUD}/configuration/stf-proxy/nginx.conf.original" > "$conf"
+output="$(zbr "$(answers "" "" "" "" "")" setup)"
+check_contains "without the checksum another configuration is reported" "the previous one is configuration/stf-proxy/nginx.conf.previous" \
+  "$output"
+check_not_contains "without the checksum another configuration is kept aside" "frame-ancestors" "$(cat "${conf}.previous")"
+rm -f "${conf}.previous"
+
+section "setup without the secrets"
+for name in RETHINKDB_ENV_AUTHKEY STF_ZMQ_CURVE_SERVER_SECRET_KEY STF_ZMQ_CURVE_SERVER_PUBLIC_KEY STF_ZMQ_CURVE_SECRET_KEY; do
+  sed -i.orig "/^${name}=/d" "${MCLOUD}/variables.env"
+done
+output="$(zbr "$(answers "" "" "" "" "")" setup)"
+authkey="$(value variables.env RETHINKDB_ENV_AUTHKEY)"
+check "the missing password of RethinkDB is generated" "48" "${#authkey}"
+check "the missing CURVE keys are made" "ok" "$(curve_keys)"
+
+section "setup questions"
+SSL="${MCLOUD}/configuration/stf-proxy/ssl"
+output="$(zbr "\n\n\nn\nhttps\n\n\ny\n\n\ny\n\nn\n" setup)"
+check "https without a certificate goes on" "0" "$?"
+check_contains "the missing certificate is reported" \
+  "missing: configuration/stf-proxy/ssl/ssl.crt and configuration/stf-proxy/ssl/ssl.key. The setup goes on, but stf-proxy does not start without it" \
+  "$output"
+check_contains "the certificate is asked for" "put the certificate (PEM) into configuration/stf-proxy/ssl/ssl.crt" "$output"
+check "the settings are written without a certificate" "https://mcloud.example.com:8082" "$(value .env STF_URL)"
+check_contains "https listens with ssl without a certificate too" "listen 80 ssl;" \
+  "$(cat "${MCLOUD}/configuration/stf-proxy/nginx.conf")"
+reset_calls
+output="$(zbr "" start)"
+check "start without the certificate of https fails" "1" "$?"
+check_contains "start reports the missing certificate" \
+  "The services are not started: stf-proxy serves https and needs its certificate, missing: configuration/stf-proxy/ssl/ssl.crt and configuration/stf-proxy/ssl/ssl.key." \
+  "$output"
+check "start without the certificate starts nothing" "" "$(calls docker | grep '^compose')"
+certificate "$SSL" mcloud.example.com
+rm -f "${SSL}/ssl.key"
+check_contains "start names the missing key only" "missing: configuration/stf-proxy/ssl/ssl.key." "$(zbr "" start)"
+certificate "$SSL" mcloud.example.com
+cp "${SSL}/ssl.crt" "${WORK}/ssl.crt"
+output="$(zbr "\n\n\nn\nhttps\n\n\ny\n\n\ny\n\nn\n" setup)"
+check "a declined address is asked again" "https://mcloud.example.com:8082" "$(value .env STF_URL)"
+check_not_contains "a certificate is not reported" "missing:" "$output"
+check "the key of the certificate is readable for its owner only" "-rw-------" "$(mode configuration/stf-proxy/ssl/ssl.key)"
+check_contains "https listens with ssl" "listen 80 ssl;" "$(cat "${MCLOUD}/configuration/stf-proxy/nginx.conf")"
+check_contains "the ssl settings are uncommented" $'\n    ssl_certificate /etc/nginx/ssl/ssl.crt;' \
+  "$(cat "${MCLOUD}/configuration/stf-proxy/nginx.conf")"
+check "the certificate of the user is kept" "same" "$(cmp -s "${SSL}/ssl.crt" "${WORK}/ssl.crt" && echo same)"
+certificate "${WORK}/other" other.example.com
+cp "${WORK}/other/ssl.key" "${SSL}/ssl.key"
+reset_calls
+output="$(zbr "" start)"
+check "start with a key of another certificate fails" "1" "$?"
+check_contains "start reports the key of another certificate" \
+  "The services are not started: configuration/stf-proxy/ssl/ssl.key is not the key of configuration/stf-proxy/ssl/ssl.crt" "$output"
+check "start with a key of another certificate starts nothing" "" "$(calls docker | grep '^compose')"
+cp "${MCLOUD}/.env" "${WORK}/env.saved"
+output="$(zbr "$(answers "" keep.example.com "" "" "")" setup)"
+check "a key of another certificate fails" "1" "$?"
+check_contains "a key of another certificate is reported" "is not the key of" "$output"
+check_contains "the fix of the key is explained" "put the key of that certificate there, then run ./zebrunner.sh setup again" "$output"
+check_contains "the kept answers are reported" "nothing but your answers is written" "$output"
+check "nothing but the answers is written for a key of another certificate" "same" \
+  "$(cmp -s "${MCLOUD}/.env" "${WORK}/env.saved" && echo same)"
+check_contains "the answers are kept for the next setup" 'ZBR_HOSTNAME="keep.example.com"' \
+  "$(cat "${MCLOUD}/backup/settings.env")"
+check "the kept answers are readable for their owner only" "-rw-------" "$(mode backup/settings.env)"
+cp "${REPO}/tests/fixtures/shared-ssl.crt" "${SSL}/ssl.crt"
+output="$(zbr "$(answers "" mcloud.example.com "" "" "")" setup)"
+check "the shared self-signed certificate fails" "1" "$?"
+check_contains "the shared self-signed certificate is reported" "its private key is public" "$output"
+rm -f "${SSL}/ssl.crt" "${SSL}/ssl.key"
+zbr "$(answers http "" "" "" "")" setup > /dev/null
+check "http needs no certificate" "http://mcloud.example.com:8082" "$(value .env STF_URL)"
+# invalid answers are asked again: a protocol, a host with a port and a host with the protocol, a port of letters and
+# one too big; the end of the input with an invalid value fails
+output="$(zbr "ftp\nhttp\nmcloud.example.com:80\nhttp://mcloud.example.com\nmcloud.example.com\nabc\n70000\n8080\ny\n\n\ny\n\nn\n" setup)"
+check "invalid answers are asked again" "http://mcloud.example.com:8080" "$(value .env STF_URL)"
+check_contains "an invalid protocol is explained" "Please answer http or https." "$output"
+check_contains "an invalid host is explained" "A host name or an IP address only" "$output"
+check_contains "an invalid port is explained" "A port number from 1 to 65535." "$output"
+check "the port is written" "8080" "$(value .env STF_PORT)"
+zbr "$(answers "" "" 8082 "" "")" setup > /dev/null
+# an invalid host of the previous setup (or none, when ifconfig.me does not answer) and no more input
+cp "${MCLOUD}/backup/settings.env" "${WORK}/settings.saved"
+echo 'declare -x ZBR_HOSTNAME="bad host"' >> "${MCLOUD}/backup/settings.env"
+output="$(zbr "\n" setup)"
+check "the end of the input with an invalid value fails" "1" "$?"
+check_contains "the invalid host is reported" "A host name or an IP address only" "$output"
+# the first setup offers ZBR_HOSTNAME of the environment instead of the address of ifconfig.me (README.md#run)
+rm -f "${MCLOUD}/backup/settings.env"
+zbr_env=(ZBR_HOSTNAME=env.example.com)
+zbr "$(answers "" "" "" "" "")" setup > /dev/null
+zbr_env=()
+check "the first setup offers ZBR_HOSTNAME of the environment" "https://env.example.com:443" "$(value .env STF_URL)"
+mv "${WORK}/settings.saved" "${MCLOUD}/backup/settings.env"
+zbr "$(answers "" "" 8082 "" "")" setup > /dev/null
+
+section "the host of the nodes"
+replace "${MCLOUD}/.env" "AGENTS_ADDRESS=10.0.0.5" "AGENTS_ADDRESS=10.0.0.6"
+zbr "" start > /dev/null
+check "start writes NODES_HOST of a new AGENTS_ADDRESS" "10.0.0.6" "$(value .env NODES_HOST)"
+replace "${MCLOUD}/.env" "AGENTS_ADDRESS=10.0.0.6" "AGENTS_ADDRESS=0.0.0.0"
+sed -i.orig '/^NODES_HOST=/d' "${MCLOUD}/.env"
+output="$(zbr "" start)"
+check "start adds a missing NODES_HOST" "mcloud.example.com" "$(value .env NODES_HOST)"
+check_contains "start reports AGENTS_ADDRESS 0.0.0.0 with a hint for the nodes on the server" \
+  "set AGENTS_ADDRESS to the LAN address of the server and run ./zebrunner.sh restart (README.md#devices-on-the-mcloud-server)" \
+  "$output"
+replace "${MCLOUD}/.env" "AGENTS_ADDRESS=0.0.0.0" "AGENTS_ADDRESS=10.0.0.5"
+output="$(zbr "" start)"
+check_not_contains "start does not report a LAN address in AGENTS_ADDRESS" "AGENTS_ADDRESS" "$output"
+if docker compose version > /dev/null 2>&1; then
+  check "stf-api gives the nodes the ZeroMQ endpoints at NODES_HOST" \
+    "--nodes-connect-sub tcp://10.0.0.5:7250 --nodes-connect-push tcp://10.0.0.5:7270 --nodes-connect-app-dealer tcp://10.0.0.5:7160 --nodes-connect-dev-dealer tcp://10.0.0.5:7260" \
+    "$(cd "$MCLOUD" && docker compose config --format json 2> /dev/null |
+      python3 -c 'import json, sys; c = json.load(sys.stdin)["services"]["stf-api"]["command"]; print(" ".join(c[c.index("--nodes-connect-sub"):]))')"
+  check "the triproxies, the storage and stf-api get STF_NODES_API_URL" "http://stf-api:3000 http://stf-api:3000 http://stf-api:3000 http://stf-api:3000" \
+    "$(cd "$MCLOUD" && docker compose config --format json 2> /dev/null | python3 -c 'import json, sys
+s = json.load(sys.stdin)["services"]
+print(" ".join(s[n]["environment"]["STF_NODES_API_URL"] for n in ("stf-triproxy-app", "stf-triproxy-dev", "stf-storage-temp", "stf-api")))')"
+fi
+if docker compose version > /dev/null 2>&1; then
+  check "stf-api gets no AGENT_HOSTS" "" "$(cd "$MCLOUD" && docker compose config 2> /dev/null | grep AGENT_HOSTS)"
+fi
+
+section "adb relay"
+# relay_setting <name> <value>: a setting of the auto mode of adb-relay in .env
+relay_setting() {
+  sed -i.orig "s|^$1=.*|$1=$2|" "${MCLOUD}/.env"
+}
+check "the auto mode is off by default" "false:300:" \
+  "$(sed -n 's/^ADB_RELAY=//p' "${REPO}/.env.original"):$(value .env ADB_RELAY_SYNC_SECONDS):$(value .env ADB_RELAY_PORTS)"
+reset_calls
+zbr "" start > /dev/null
+check "start without ADB_RELAY starts no adb-relay" "network|inspect|infra
+compose|up|-d" "$(docker_calls)"
+relay_setting ADB_RELAY true
+reset_calls
+output="$(zbr "" start)"
+check "ADB_RELAY=true starts adb-relay" "network|inspect|infra
+compose|--profile|adb-relay|up|-d" "$(docker_calls)"
+token_file="${MCLOUD}/configuration/adb-relay/stf-token"
+check "the auto mode gets STF_TOKEN of variables.env only" "api-token" "$(cat "$token_file")"
+check "the token file is readable for its owner only" "-rw-------" "$(mode configuration/adb-relay/stf-token)"
+token_inode="$(inode configuration/adb-relay/stf-token)"
+replace "${MCLOUD}/variables.env" "STF_TOKEN=api-token" "STF_TOKEN='new-token'"
+chmod 644 "$token_file"
+zbr "" start > /dev/null
+check "start writes a new STF_TOKEN without the quotes" "new-token" "$(cat "$token_file")"
+check "the token file is written in place" "$token_inode" "$(inode configuration/adb-relay/stf-token)"
+check "start makes the token file readable for its owner only again" "-rw-------" "$(mode configuration/adb-relay/stf-token)"
+replace "${MCLOUD}/variables.env" "STF_TOKEN='new-token'" "STF_TOKEN=api-token"
+rm -f "$token_file"
+zbr "" restart > /dev/null
+check "restart writes a missing token file for its owner only" "api-token:-rw-------" \
+  "$(cat "$token_file"):$(mode configuration/adb-relay/stf-token)"
+check_not_contains "no warning of the auto mode with its settings" "adb-relay" "$output"
+relay_setting ADB_RELAY_PORTS 7400-7799
+relay_setting ADB_RELAY_SYNC_SECONDS 10
+zbr "$(answers "" "" "" "" "")" setup > /dev/null
+check "the setup keeps the settings of the auto mode" "true:7400-7799:10" \
+  "$(value .env ADB_RELAY):$(value .env ADB_RELAY_PORTS):$(value .env ADB_RELAY_SYNC_SECONDS)"
+for value in 7400 80-90 7799-7400 x; do
+  relay_setting ADB_RELAY_PORTS "$value"
+  check_contains "ADB_RELAY_PORTS '${value}' is reported" \
+    "ADB_RELAY_PORTS of .env '${value}' is not <first>-<last> of the ports 1024-65535: adb-relay relays no device of STF." \
+    "$(zbr "" start)"
+done
+relay_setting ADB_RELAY_PORTS ""
+relay_setting ADB_RELAY_SYNC_SECONDS 0
+check_contains "an invalid ADB_RELAY_SYNC_SECONDS is reported" \
+  "ADB_RELAY_SYNC_SECONDS of .env '0' is not a number of seconds: adb-relay reads the devices every 300 seconds." "$(zbr "" start)"
+relay_setting ADB_RELAY_SYNC_SECONDS 30
+replace "${MCLOUD}/variables.env" "STF_TOKEN=api-token" "STF_TOKEN="
+output="$(zbr "" start)"
+replace "${MCLOUD}/variables.env" "STF_TOKEN=" "STF_TOKEN=api-token"
+check_contains "the auto mode without STF_TOKEN is reported" \
+  "STF_TOKEN of variables.env is empty: adb-relay (ADB_RELAY=true) relays no device of STF." "$output"
+relay_setting ADB_RELAY yes
+reset_calls
+output="$(zbr "" start)"
+check_contains "an invalid ADB_RELAY is reported" "ADB_RELAY of .env is 'yes', not true or false: the auto mode of adb-relay is off." "$output"
+check "an invalid ADB_RELAY starts no adb-relay" "network|inspect|infra
+compose|up|-d" "$(docker_calls)"
+relay_setting ADB_RELAY false
+reset_calls
+zbr "" start > /dev/null
+check "ADB_RELAY=false starts no adb-relay" "network|inspect|infra
+compose|up|-d" "$(docker_calls)"
+check "ADB_RELAY=false empties the token file" "" "$(cat "$token_file")"
+if docker compose version > /dev/null 2>&1; then
+  relay_setting ADB_RELAY true
+  relay_setting ADB_RELAY_PORTS 7400-7799
+  check "docker compose passes the settings of the auto mode to adb-relay" "ADB_RELAY: \"true\"
+ADB_RELAY_PORTS: 7400-7799
+ADB_RELAY_SYNC_SECONDS: \"30\"" \
+    "$(cd "$MCLOUD" && docker compose --profile adb-relay config 2> /dev/null |
+      sed -n '/^  adb-relay:/,/^  [a-z]/p' | grep -E '^      ADB_RELAY' | sed 's/^ *//')"
+  relay_setting ADB_RELAY false
+  relay_setting ADB_RELAY_PORTS ""
+else
+  skip_check "docker compose passes the settings of the auto mode to adb-relay" "requires docker compose"
+fi
+
+section "sign-in"
+# the answers: the sign-in, its settings with a secret, a scope, a domain of the users, no start; the secret is literal
+# shellcheck disable=SC2016
+output="$(zbr "$(printf '%s\n' "" "" "" y "" "" y oauth2 https://idp.example.com/authorize https://idp.example.com/token \
+  https://idp.example.com/userinfo mcloud-client "it's" 'a$b&c d' "" example.com n)" setup)"
+check "the OAuth2 sign-in" "auth-oauth2:auth/oauth/" "$(value .env AUTH_SYSTEM):$(value .env AUTH_URL)"
+check_contains "the callback URL is shown" "redirects to http://mcloud.example.com:8082/auth/oauth/callback" "$output"
+check_contains "a quote is asked again" "Quotes and backslashes are not supported." "$output"
+check "the authorization URL" "'https://idp.example.com/authorize'" "$(value variables.env OAUTH_AUTHORIZATION_URL)"
+check "the client secret is kept as typed" "'a\$b&c d'" "$(value variables.env OAUTH_CLIENT_SECRET)"
+# shellcheck disable=SC2016
+check_not_contains "the client secret is not shown" 'a$b&c d' "$output"
+check "the scope of OpenID Connect by default" "'openid email'" "$(value variables.env OAUTH_SCOPE)"
+check "the domain of the users" "'example.com'" "$(value variables.env OAUTH_DOMAIN)"
+check "the callback URL" "'http://mcloud.example.com:8082/auth/oauth/callback'" "$(value variables.env OAUTH_CALLBACK_URL)"
+output="$(zbr "$(printf '%s\n' "" "" "" y "" "" y "" "" "" "" "" "" "" "" n)" setup)"
+check "the OAuth2 sign-in is the default of the next setup" "auth-oauth2" "$(value .env AUTH_SYSTEM)"
+check "the client secret is kept by the next setup" "'a\$b&c d'" "$(value variables.env OAUTH_CLIENT_SECRET)"
+check "the domain is kept by the next setup" "'example.com'" "$(value variables.env OAUTH_DOMAIN)"
+if docker compose version > /dev/null 2>&1; then
+  # shellcheck disable=SC2016
+  check_contains "docker compose reads the quoted values" 'OAUTH_CLIENT_SECRET: a$$b&c d' \
+    "$(cd "$MCLOUD" && docker compose config 2> /dev/null | grep OAUTH_CLIENT_SECRET | sed 's/^ *//')"
+else
+  skip_check "docker compose reads the quoted values" "requires docker compose"
+fi
+zbr "$(printf '%s\n' "" "" "" y "" "" y ldap ldap://ldap.example.com:389 "" "ou=people,dc=example,dc=com" "" n)" \
+  setup > /dev/null
+check "the LDAP sign-in" "auth-ldap:auth/ldap/" "$(value .env AUTH_SYSTEM):$(value .env AUTH_URL)"
+check "the LDAP URL" "'ldap://ldap.example.com:389'" "$(value variables.env LDAP_URL)"
+check "the attribute of the user name by default" "'uid'" "$(value variables.env LDAP_SEARCH_FIELD)"
+output="$(zbr "$(printf '%s\n' "" "" "" y "" "" y oracle mock n)" setup)"
+check_contains "an unknown sign-in is asked again" "Please answer mock, oauth2 or ldap." "$output"
+# the end of the input at a question without a valid answer ends the setup, it is not asked again forever
+if [[ -n "$TIMEOUT" ]]; then
+  cp "${MCLOUD}/variables.env" "${WORK}/variables.before"
+  sed -i.orig "s|^OAUTH_AUTHORIZATION_URL=.*|OAUTH_AUTHORIZATION_URL=''|" "${MCLOUD}/variables.env"
+  cp "${MCLOUD}/variables.env" "${WORK}/variables.saved"
+  output="$(zbr_end "$(printf '%s\n' "" "" "" y "" "" y oauth2)" setup)"
+  check_contains "the end of the input without a value fails" "exit 1" "$output"
+  check_contains "the end of the input is explained" \
+    "The input ended at the question 'Authorization URL': A value is needed." "$output"
+  check "the question is not asked again" "1" "$(grep -c 'A value is needed' <<< "$output")"
+  output="$(zbr_end "$(printf '%s\n' "" "" "" y "" "" y ldap ldap://ldap.example.com:389 "cn=admin")" setup)"
+  check_contains "the end of the input without a secret fails" "exit 1" "$output"
+  check_contains "the end of the input at a secret is explained" \
+    "The input ended at the question 'Bind password': A value is needed." "$output"
+  cp "${MCLOUD}/backup/settings.env" "${WORK}/settings.saved"
+  echo 'declare -x ZBR_MCLOUD_SIGN_IN="zebrunner"' >> "${MCLOUD}/backup/settings.env"
+  output="$(zbr_end "$(printf '%s\n' "" "" "" y "" "" y)" setup)"
+  check_contains "the end of the input with an invalid sign-in fails" "exit 1" "$output"
+  check_contains "the end of the input at the sign-in is explained" \
+    "The input ended at the question 'Sign-in of STF': Please answer mock, oauth2 or ldap." "$output"
+  mv "${WORK}/settings.saved" "${MCLOUD}/backup/settings.env"
+  check "the setup that ended wrote no variables.env" "same" \
+    "$(cmp -s "${MCLOUD}/variables.env" "${WORK}/variables.saved" && echo same)"
+  mv "${WORK}/variables.before" "${MCLOUD}/variables.env"
+else
+  skip_check "the end of the input at a question without a valid answer" "requires timeout"
+fi
+check "the mock sign-in again" "auth-mock" "$(value .env AUTH_SYSTEM)"
+
+section "setup of Zebrunner CE"
+rm -f "${MCLOUD}/variables.env" "${MCLOUD}/backup/settings.env"
+zbr_env=(ZBR_INSTALLER=1 ZBR_PROTOCOL=https ZBR_HOSTNAME=ce.example.com ZBR_PORT=443)
+output="$(zbr "" setup)"
+check "https of Zebrunner CE without its certificate goes on" "0" "$?"
+check_contains "the certificate of Zebrunner CE is asked for" \
+  "../nginx/ssl/ssl.crt and ../nginx/ssl/ssl.key are missing. The setup goes on, but stf-proxy does not start without a certificate" \
+  "$output"
+check_not_contains "the missing certificate of Zebrunner CE is reported once" "missing: configuration/stf-proxy/ssl" "$output"
+check "the setup of Zebrunner CE without its certificate writes the settings" "https://ce.example.com:443" "$(value .env STF_URL)"
+certificate "${WORK}/nginx/ssl" ce.example.com
+# a key of root only (e.g. of certbot): root reads any file, so the check runs for another user only
+if [[ "$(id -u)" -ne 0 ]]; then
+  chmod 000 "${WORK}/nginx/ssl/ssl.key"
+  output="$(zbr "" setup)"
+  check "https of Zebrunner CE with a key that is not readable fails" "1" "$?"
+  chmod 600 "${WORK}/nginx/ssl/ssl.key"
+  check_contains "the key that is not readable is reported" "The certificate of Zebrunner CE (../nginx/ssl/ssl.crt and ssl.key) cannot be copied" "$output"
+else
+  skip_check "https of Zebrunner CE with a key that is not readable" "root reads any file"
+fi
+output="$(zbr "" setup)"
+check "the certificate of Zebrunner CE is used" "same" "$(cmp -s "${WORK}/nginx/ssl/ssl.crt" "${SSL}/ssl.crt" && echo same)"
+check "the key of Zebrunner CE is used" "same" "$(cmp -s "${WORK}/nginx/ssl/ssl.key" "${SSL}/ssl.key" && echo same)"
+check "the setup asks nothing" "" "$(grep 'Zebrunner MCloud STF URL' <<< "$output")"
+check "STF_URL is the one of Zebrunner CE" "https://ce.example.com:443" "$(value .env STF_URL)"
+check "STF_PORT is the internal one" "8082" "$(value .env STF_PORT)"
+check "the Zebrunner sign-in" "auth-zebrunner" "$(value .env AUTH_SYSTEM)"
+check "the Zebrunner sign-in URL" "auth/zebrunner/" "$(value .env AUTH_URL)"
+check "ZEBRUNNER_LOGIN_URL" "https://ce.example.com:443/api/iam/v1/auth/login" "$(value variables.env ZEBRUNNER_LOGIN_URL)"
+check "ZEBRUNNER_USERINFO_URL" "https://ce.example.com:443/api/iam/v1/users" "$(value variables.env ZEBRUNNER_USERINFO_URL)"
+secret="$(value variables.env SECRET)"
+check "a new SECRET is generated" "48" "${#secret}"
+check_not_contains "Zebrunner CE starts the services itself" "need to be started after setup" "$output"
+check "the CURVE keys of a new deployment of Zebrunner CE" "ok" "$(curve_keys)"
+sed -i.orig -e "/^STF_ZMQ_CURVE_SERVER_SECRET_KEY=/d" -e "/^RETHINKDB_ENV_AUTHKEY=/d" "${MCLOUD}/variables.env"
+zbr "" setup > /dev/null
+check "Zebrunner CE makes the missing CURVE keys" "ok" "$(curve_keys)"
+authkey="$(value variables.env RETHINKDB_ENV_AUTHKEY)"
+check "Zebrunner CE generates the missing password of RethinkDB" "48" "${#authkey}"
+# the certificate of Zebrunner CE is gone, the copy of an earlier setup stays
+mv "${WORK}/nginx/ssl" "${WORK}/nginx/ssl.saved"
+output="$(zbr "" setup)"
+check "Zebrunner CE without its certificate keeps the earlier copy" "0" "$?"
+check_contains "the earlier copy is reported" "stf-proxy keeps the earlier copy of configuration/stf-proxy/ssl, which may be old" "$output"
+check_not_contains "the earlier copy is not reported as missing" "does not start without a certificate" "$output"
+mv "${WORK}/nginx/ssl.saved" "${WORK}/nginx/ssl"
+cp "${REPO}/tests/fixtures/shared-ssl.crt" "${WORK}/nginx/ssl/ssl.crt"
+# the key of the shared certificate is not in the repository: openssl takes the pair as a match
+stub openssl 'echo same'
+output="$(zbr "" setup)"
+rm -f "${WORK}/bin/openssl"
+check "the shared certificate of Zebrunner CE is used" "0" "$?"
+check_contains "the shared certificate of Zebrunner CE is reported" "the self-signed one of its repository" "$output"
+zbr_env=()
+
+section "setup of the MCloud of Zebrunner CE"
+certificate "${WORK}/nginx/ssl" ce.example.com
+# the answers: the admin with its confirmation, the default sign-in, no start of the services
+zbr "$(printf '%s\n' "" "" y "" n)" setup > /dev/null
+check "Zebrunner IAM is the default sign-in" "auth-zebrunner" "$(value .env AUTH_SYSTEM)"
+# the answers: the admin with its confirmation, the sign-in ldap with its URL, no bind DN, the search DN, the default
+# attribute, no start of the services
+output="$(zbr "$(printf '%s\n' "" "" y ldap ldap://ldap.example.com:389 "" ou=people,dc=example,dc=com "" n)" setup)"
+check "the setup of the MCloud of Zebrunner CE succeeds" "0" "$?"
+check "no protocol, host or port is asked" "" "$(grep 'Zebrunner MCloud STF URL' <<< "$output")"
+check_contains "the URL of Zebrunner CE is shown" "Zebrunner MCloud of Zebrunner CE: https://ce.example.com:443" "$output"
+check "STF_URL stays the one of Zebrunner CE" "https://ce.example.com:443" "$(value .env STF_URL)"
+check "STF_PORT stays the internal one" "8082" "$(value .env STF_PORT)"
+check "the sign-in of the setup" "auth-ldap" "$(value .env AUTH_SYSTEM)"
+check "the certificate of Zebrunner CE stays" "same" "$(cmp -s "${WORK}/nginx/ssl/ssl.crt" "${SSL}/ssl.crt" && echo same)"
+check_contains "the start is offered" "need to be started after setup" "$output"
+zbr_env=(ZBR_INSTALLER=1 ZBR_PROTOCOL=https ZBR_HOSTNAME=ce.example.com ZBR_PORT=443)
+zbr "" setup > /dev/null
+zbr_env=()
+check "the setup of Zebrunner CE keeps the sign-in" "auth-ldap" "$(value .env AUTH_SYSTEM)"
+check "the setup of Zebrunner CE keeps the LDAP settings" "'ldap://ldap.example.com:389'" "$(value variables.env LDAP_URL)"
+check "the setup of Zebrunner CE keeps its port" "8082" "$(value .env STF_PORT)"
+
+section "the CURVE keys without openssl"
+check "patch/curve_keygen.py: the X25519 test vector of RFC 7748" \
+  "public=8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a" \
+  "$(echo 77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a | python3 "${REPO}/patch/curve_keygen.py" - | head -1)"
+rm -f "${MCLOUD}/variables.env" "${MCLOUD}/backup/settings.env"
+# openssl without X25519 (the LibreSSL of macOS): patch/curve_keygen.py makes them
+stub openssl 'exit 1'
+output="$(zbr "$(answers "" "" "" "" "")" setup)"
+check "python3 makes the CURVE keys" "ok" "$(curve_keys)"
+check_not_contains "a new setup without the volume of the database reports none" "has the database of STF" "$output"
+rm -f "${MCLOUD}/variables.env"
+cp "${MCLOUD}/.env" "${WORK}/env.saved"
+stub python3 'exit 127'
+output="$(zbr "$(answers "" "" "" "" "")" setup)"
+check "the setup fails without the CURVE keys" "1" "$?"
+rm -f "${WORK}/bin/openssl" "${WORK}/bin/python3"
+check_contains "the missing tools of the CURVE keys are reported" "openssl (X25519, OpenSSL 1.1.1+) or python3" "$output"
+check_contains "the answers are kept without the CURVE keys" "nothing but your answers is written" "$output"
+check "nothing is written without the CURVE keys" "same" "$(cmp -s "${MCLOUD}/.env" "${WORK}/env.saved" && echo same)"
+check "no variables.env without the CURVE keys" "no" "$([[ -f "${MCLOUD}/variables.env" ]] && echo yes || echo no)"
+# the database of an earlier MCloud in the volume of the folder: the new SECRET fails its access tokens
+touch "${WORK}/db-volume"
+reset_calls
+output="$(zbr "$(answers "" "" "" "" "")" setup)"
+rm -f "${WORK}/db-volume"
+check "the keys are made by the next setup" "ok" "$(curve_keys)"
+check_contains "the volume of the folder is asked" "volume|inspect|mcloud_stf-db-volume" "$(calls docker)"
+check_contains "a new setup reports the database of an earlier MCloud" \
+  "The docker volume mcloud_stf-db-volume has the database of STF of an earlier MCloud" "$output"
+check_contains "the access tokens of the earlier database are explained" \
+  "the access tokens of that database fail (the STF API answers 500 to them)" "$output"
+reset_calls
+touch "${WORK}/db-volume"
+output="$(zbr "$(answers "" "" "" "" "")" setup)"
+rm -f "${WORK}/db-volume"
+check_not_contains "the setup again does not report its own database" "has the database of STF" "$output"
+
+section "compose"
+if docker compose version > /dev/null 2>&1; then
+  run_check "docker compose config of the settings of the setup" \
+    bash -c "cd '${MCLOUD}' && test -z \"\$(docker compose config --quiet 2>&1)\""
+  run_check "docker compose config with adb-relay" \
+    bash -c "cd '${MCLOUD}' && test -z \"\$(docker compose --profile adb-relay config --quiet 2>&1)\""
+  check "adb-relay runs with its profile only" "adb-relay" \
+    "$(cd "$MCLOUD" && comm -13 <(docker compose config --services | sort) \
+      <(docker compose --profile adb-relay config --services | sort))"
+  # the variables of the grid, sorted; none of the secrets of STF, the secret of stf-proxy for the grid only
+  check "the grid gets none of the secrets of variables.env" \
+    "CHECK_APPIUM_STATUS GRID_AUTH_SECRET GRID_NEW_SESSION_WAIT_TIMEOUT PLAYWRIGHT_ENABLED STF_TOKEN STF_URL" \
+    "$(cd "$MCLOUD" && docker compose config --format json | python3 -c 'import json, sys
+print(" ".join(sorted(json.load(sys.stdin)["services"]["mcloud-grid"]["environment"])))')"
+else
+  skip_check "docker compose config of the settings of the setup" "requires docker compose"
+fi
+
+section "start"
+reset_calls
+zbr "$(answers "" "" "" "" "" | sed '$d')\ny\n" setup > /dev/null
+check "the setup starts the services when confirmed" "network|inspect|infra
+compose|up|-d" "$(docker_calls)"
+reset_calls
+output="$(zbr "" start)"
+check "start starts the services in the infra network" "network|inspect|infra
+compose|up|-d" "$(docker_calls)"
+check_contains "start shows the URLs" "MCloud: https://203.0.113.10:443/stf, the Selenium/Appium hub: https://<user>:<token>@203.0.113.10:443/mcloud/wd/hub" "$output"
+check_contains "start asks STF_TOKEN of the grid" "STF_TOKEN of variables.env is empty: the grid reserves no device" "$output"
+replace "${MCLOUD}/variables.env" "STF_TOKEN=" "STF_TOKEN=token"
+check_not_contains "start with STF_TOKEN does not ask it" "STF_TOKEN of variables.env is empty" "$(zbr "" start)"
+check "start gives the grid the new STF_TOKEN" "STF_TOKEN=token" "$(grep '^STF_TOKEN=' "${MCLOUD}/grid.env")"
+replace "${MCLOUD}/variables.env" "STF_TOKEN=token" "STF_TOKEN="
+zbr_env=(ZBR_INSTALLER=1)
+check_not_contains "Zebrunner CE shows no next steps" "MCloud: " "$(zbr "" start)"
+zbr_env=()
+reset_calls
+zbr_env=(NO_NETWORK=1)
+zbr "" start > /dev/null
+zbr_env=()
+check "start creates a missing infra network" "network|inspect|infra
+network|create|infra
+compose|up|-d" "$(docker_calls)"
+reset_calls
+mv "${MCLOUD}/.env" "${MCLOUD}/.env.saved"
+zbr "$(answers "" "" "" "" "")" start > /dev/null
+check "the first start runs the setup and fails" "1" "$?"
+check "the first start writes .env" "yes" "$([[ -f "${MCLOUD}/.env" ]] && echo yes)"
+check "the first start does not start the services" "" "$(calls docker | grep compose)"
+mv "${MCLOUD}/.env.saved" "${MCLOUD}/.env"
+
+# the containers of the compose project of the folder: of another folder of the same name, of a removed one, its own
+reset_calls
+zbr "" start > /dev/null
+check_contains "start asks the folder of the database container of the project" \
+  "ps|-a|--filter|label=com.docker.compose.project=mcloud|--filter|label=com.docker.compose.service=rethinkdb" \
+  "$(calls docker)"
+mkdir -p "${WORK}/other-folder/mcloud"
+echo "${WORK}/other-folder/mcloud" > "${WORK}/project-dir"
+reset_calls
+output="$(zbr "" start)"
+check "start with the containers of another folder fails" "1" "$?"
+check_contains "the containers of another folder are reported" \
+  "./zebrunner.sh start did nothing: the docker compose project mcloud is the MCloud of ${WORK}/other-folder/mcloud" "$output"
+check_contains "the removal of the other MCloud is suggested" "./zebrunner.sh down in ${WORK}/other-folder/mcloud" "$output"
+check "start with the containers of another folder starts nothing" "" "$(calls docker | grep '^compose')"
+# the other commands of the services do not act on the containers and the database of another folder either
+zbr_env=(SHUTDOWN_CONFIRMED=1)
+for command in stop down restart backup restore shutdown; do
+  reset_calls
+  cp "${MCLOUD}/variables.env" "${WORK}/variables.saved"
+  output="$(zbr "" "$command")"
+  check "${command} with the containers of another folder fails" "1" "$?"
+  check_contains "${command} with the containers of another folder is explained" \
+    "./zebrunner.sh ${command} did nothing: the docker compose project mcloud is the MCloud of ${WORK}/other-folder/mcloud" "$output"
+  check "${command} with the containers of another folder calls docker ps only" "" "$(docker_calls)"
+  check "${command} with the containers of another folder keeps the settings" "same" \
+    "$(cmp -s "${MCLOUD}/variables.env" "${WORK}/variables.saved" && echo same)"
+done
+zbr_env=()
+check "restart with the containers of another folder explains it once" "1" "$(grep -c 'did nothing' <<< "$(zbr "" restart)")"
+echo "${WORK}/removed-folder/mcloud" > "${WORK}/project-dir"
+check "start replaces the containers of a removed folder" "0" "$(
+  zbr "" start > /dev/null
+  echo "$?"
+)"
+echo "$MCLOUD" > "${WORK}/project-dir"
+reset_calls
+zbr "" start > /dev/null
+check "start with its own containers" "network|inspect|infra
+compose|up|-d" "$(docker_calls)"
+rm -f "${WORK}/project-dir"
+
+# the files of an earlier start: the secrets get the mode of their owner only
+chmod 664 "${MCLOUD}/variables.env" "${MCLOUD}/backup/settings.env"
+zbr "" start > /dev/null
+check "start makes variables.env readable for its owner only" "-rw-------" "$(mode variables.env)"
+check "start makes backup/settings.env readable for its owner only" "-rw-------" "$(mode backup/settings.env)"
+# sudo ./zebrunner.sh: root gives the files back to the owner of the folder (id and chown are stubs)
+# shellcheck disable=SC2016 # the stub body is expanded when the stub runs
+stub id '[[ "$1" == "-u" ]] && echo 0 && exit 0; /usr/bin/id "$@"'
+record_stub chown
+reset_calls
+zbr "" start > /dev/null
+rm -f "${WORK}/bin/id" "${WORK}/bin/chown"
+owner="$(stat -c '%u:%g' "$MCLOUD" 2> /dev/null || stat -f '%u:%g' "$MCLOUD")"
+check_contains "root gives variables.env back to the owner of the folder" "${owner}|variables.env" "$(calls chown)"
+check_contains "root gives stf-token back to the owner of the folder" \
+  "${owner}|configuration/adb-relay/stf-token" "$(calls chown)"
+check_contains "root gives grid.env back to the owner of the folder" "${owner}|grid.env" "$(calls chown)"
+
+section "STF_TOKEN of the admin"
+token="$(printf 'a%.0s' $(seq 64))"
+sed -i.bak 's/^STF_TOKEN=.*/STF_TOKEN=/' "${MCLOUD}/variables.env"
+rm -f "${MCLOUD}/variables.env.bak" "${WORK}/new-token" "${WORK}/migrate-fails"
+# an STF image without stf token-add: the token is asked as before
+reset_calls
+output="$(zbr "" start)"
+check "an empty STF_TOKEN: the migration, then stf token-add" "compose|run|--rm|-T|stf-migrate
+compose|run|--rm|-T|--no-deps|stf-migrate|stf|token-add|--title|mcloud" "$(token_calls)"
+check_contains "an STF image without token-add is reported" "STF_TOKEN is not created (an STF image without stf token-add?): Unknown argument: token-add" "$output"
+check_contains "without token-add the token is asked as before" "STF_TOKEN of variables.env is empty: the grid reserves no device" "$output"
+check "without token-add STF_TOKEN stays empty" "" "$(value variables.env STF_TOKEN)"
+check "without token-add the services start" "network|inspect|infra
+compose|up|-d" "$(docker_calls)"
+# the token of stf token-add
+echo "$token" > "${WORK}/new-token"
+reset_calls
+output="$(zbr "" start)"
+check_contains "the new STF_TOKEN is reported" "STF_TOKEN of variables.env is a new access token of the admin of STF" "$output"
+check_not_contains "a new STF_TOKEN is not asked" "the grid reserves no device" "$output"
+check "STF_TOKEN of variables.env is the token of stf token-add" "$token" "$(value variables.env STF_TOKEN)"
+check "the grid gets the new STF_TOKEN" "STF_TOKEN=${token}" "$(grep '^STF_TOKEN=' "${MCLOUD}/grid.env")"
+check "the token is made before the services start" "run run up" \
+  "$(calls docker | grep '^compose|' | grep -o -e 'run' -e 'up' | paste -s -d ' ' -)"
+check "variables.env with the token is readable for its owner only" "-rw-------" "$(mode variables.env)"
+reset_calls
+zbr "" start > /dev/null
+check "an STF_TOKEN that is set is kept" "" "$(token_calls)"
+# a database that is not migrated: no token, the services start
+sed -i.bak 's/^STF_TOKEN=.*/STF_TOKEN=/' "${MCLOUD}/variables.env"
+rm -f "${MCLOUD}/variables.env.bak"
+touch "${WORK}/migrate-fails"
+reset_calls
+output="$(zbr "" start)"
+check_contains "a failed migration is reported" "The database of STF is not migrated, STF_TOKEN is not created: FTL/cli:migrate" "$output"
+check "a failed migration: no stf token-add" "compose|run|--rm|-T|stf-migrate" "$(token_calls)"
+check "a failed migration: STF_TOKEN stays empty" "" "$(value variables.env STF_TOKEN)"
+check_contains "a failed migration: the services start" "compose|up|-d" "$(docker_calls)"
+rm -f "${WORK}/new-token" "${WORK}/migrate-fails"
+
+section "stop, down, restart"
+# with the profile of adb-relay: it stops and goes also when ADB_RELAY was turned off after its start
+reset_calls
+zbr "" stop > /dev/null
+check "stop" "compose|--profile|adb-relay|--profile|mdm|stop" "$(docker_calls)"
+reset_calls
+zbr "" down > /dev/null
+check "down" "compose|--profile|adb-relay|--profile|mdm|down" "$(docker_calls)"
+reset_calls
+zbr "" restart > /dev/null
+check "restart" "compose|--profile|adb-relay|--profile|mdm|down
+network|inspect|infra
+compose|up|-d" "$(docker_calls)"
+sed -i.orig "s/^ADB_RELAY=.*/ADB_RELAY=true/" "${MCLOUD}/.env"
+reset_calls
+zbr "" restart > /dev/null
+check "restart with adb-relay" "compose|--profile|adb-relay|--profile|mdm|down
+network|inspect|infra
+compose|--profile|adb-relay|up|-d" "$(docker_calls)"
+sed -i.orig "s/^ADB_RELAY=.*/ADB_RELAY=false/" "${MCLOUD}/.env"
+
+section "version"
+check "the version is the STF tag" "mcloud: $(sed -n 's/^TAG_STF=//p' "${REPO}/.env.original")" "$(zbr "" version)"
+replace "${MCLOUD}/.env" "TAG_STF=" "TAG_STF=9."
+check "the version is the STF tag of .env" "mcloud: 9.$(sed -n 's/^TAG_STF=//p' "${REPO}/.env.original")" "$(zbr "" version)"
+replace "${MCLOUD}/.env" "TAG_STF=9." "TAG_STF="
+mv "${MCLOUD}/.env" "${WORK}/env.saved"
+check "the version before the setup is the one of .env.original" \
+  "mcloud: $(sed -n 's/^TAG_STF=//p' "${REPO}/.env.original")" "$(zbr "" version)"
+mv "${WORK}/env.saved" "${MCLOUD}/.env"
+
+section "backup and restore"
+reset_calls
+zbr "" backup > /dev/null
+for file in variables.env .env backup/settings.env configuration/stf-proxy/nginx.conf configuration/stf-proxy/nginx.conf.sha256 \
+  configuration/stf-proxy/ssl/ssl.crt; do
+  check "backup copies ${file}" "same" "$(cmp -s "${MCLOUD}/${file}" "${MCLOUD}/${file}.bak" && echo same)"
+done
+check_contains "backup archives the database" "run|--rm|--volumes-from|rethinkdb" "$(calls docker)"
+tag="$(sed -n 's/^TAG_RETHINKDB=//p' "${MCLOUD}/.env")"
+check_contains "backup archives with the image of RethinkDB, for the user only" \
+  "rethinkdb:${tag}|sh|-c|tar -czf /var/backup/rethinkdb.tar.gz /data && chown $(id -u):$(id -g) /var/backup/rethinkdb.tar.gz && chmod 600 /var/backup/rethinkdb.tar.gz" \
+  "$(calls docker)"
+for file in variables.env.bak backup/settings.env.bak configuration/stf-proxy/ssl/ssl.key.bak; do
+  check "the backup ${file} is readable for its owner only" "-rw-------" "$(mode "$file")"
+done
+check_not_contains "backup stops nothing when nothing runs" "compose|stop" "$(calls docker)"
+printf '%s\n' stf-proxy mcloud-grid rethinkdb stf-app stf-websocket > "${WORK}/running"
+reset_calls
+zbr "" backup > /dev/null
+check "backup stops the database and the STF units for the copy, then starts them again" "compose|ps|--services|--status|running
+compose|stop|rethinkdb|stf-app|stf-websocket
+run|--rm|--volumes-from|rethinkdb|-v|${MCLOUD}/backup:/var/backup|rethinkdb:${tag}|sh|-c|tar -czf /var/backup/rethinkdb.tar.gz /data \
+&& chown $(id -u):$(id -g) /var/backup/rethinkdb.tar.gz && chmod 600 /var/backup/rethinkdb.tar.gz
+compose|start|rethinkdb|stf-app|stf-websocket" "$(docker_calls)"
+rm -f "${WORK}/running"
+echo "changed" > "${MCLOUD}/variables.env"
+reset_calls
+zbr "" restore > /dev/null
+check "restore brings variables.env back" "same" "$(cmp -s "${MCLOUD}/variables.env" "${MCLOUD}/variables.env.bak" && echo same)"
+check_contains "restore stops the services first" "compose|--profile|adb-relay|--profile|mdm|stop" "$(docker_calls | head -1)"
+check_contains "restore extracts the database" "tar -xzvf /var/backup/rethinkdb.tar.gz" "$(calls docker)"
+check_contains "restore extracts with the image of RethinkDB" "rethinkdb:${tag}|bash" "$(calls docker)"
+check "restore removes the containers at the end" "compose|--profile|adb-relay|--profile|mdm|down" "$(calls docker | tail -1)"
+check "restore brings the checksum of nginx.conf back" "same" \
+  "$(cmp -s "${MCLOUD}/configuration/stf-proxy/nginx.conf.sha256" "${MCLOUD}/configuration/stf-proxy/nginx.conf.sha256.bak" && echo same)"
+# a backup without the checksum (of an earlier MCloud): restore removes the one of the later setup
+rm -f "${MCLOUD}/configuration/stf-proxy/nginx.conf.sha256.bak"
+zbr "" restore > /dev/null
+check "restore of a backup without the checksum removes it" "no" \
+  "$([[ -e "${MCLOUD}/configuration/stf-proxy/nginx.conf.sha256" ]] && echo yes || echo no)"
+zbr "" backup > /dev/null
+check "backup without the checksum has none" "no" \
+  "$([[ -e "${MCLOUD}/configuration/stf-proxy/nginx.conf.sha256.bak" ]] && echo yes || echo no)"
+zbr "$(answers "" "" "" "" "")" setup > /dev/null
+zbr "" backup > /dev/null
+
+section "nodes"
+# a deployment of https on a copy of its own; curl answers the STF API with ${WORK}/answer and ${WORK}/status
+ZBR_REPO="$MCLOUD"
+MCLOUD="${WORK}/nodes"
+copy_repo "$MCLOUD"
+certificate "${MCLOUD}/configuration/stf-proxy/ssl" mcloud.example.com
+zbr "$(answers https mcloud.example.com 443 "" "")" setup > /dev/null
+pin="$(openssl x509 -in "${MCLOUD}/configuration/stf-proxy/ssl/ssl.crt" -noout -pubkey | openssl pkey -pubin -outform DER |
+  openssl dgst -sha256 -binary | openssl base64 -A)"
+pin_url="$(printf '%s' "$pin" | sed -e 's/+/%2B/g' -e 's|/|%2F|g' -e 's/=/%3D/g')"
+invite="mci1.$(printf 'A%.0s' {1..42})_"
+admin_token="admin-token-0123456789"
+# api <status> [<body>]: the next answers of the STF API
+api() {
+  printf '%s' "$1" > "${WORK}/status"
+  printf '%s' "${2:-}" > "${WORK}/answer"
+}
+# no_curl <description> <zebrunner.sh arguments...>: the command fails without a request to the STF API
+no_curl() {
+  local description="$1"
+  shift
+  reset_calls
+  output="$(zbr "" "$@")"
+  check "${description}: fails" "1" "$?"
+  check "${description}: no request" "" "$(calls curl)"
+}
+output="$(zbr "" node-invite lab-1 10.0.0.5)"
+check "an invite needs STF_TOKEN" "1" "$?"
+check_contains "the empty STF_TOKEN is reported" "STF_TOKEN of variables.env is empty" "$output"
+replace "${MCLOUD}/variables.env" "STF_TOKEN=" "STF_TOKEN=${admin_token}"
+reset_calls
+output="$(zbr "" node-invite lab-1 10.0.0.5 --help)"
+check "node-invite --help succeeds" "0:" "$?:$(calls curl)"
+check_contains "node-invite --help shows its usage, no invite" "> ./zebrunner.sh node-invite <label> <address> [<minutes>]" "$output"
+check_not_contains "node-invite --help prints no join string" "mcloud-join://" "$output"
+no_curl "the usage of node-invite" node-invite lab-1
+check_contains "the usage of node-invite is shown" "Usage: ./zebrunner.sh node-invite <label> <address> [<minutes>]" "$output"
+for label in Lab-1 -lab lab_1 "" "$(printf 'a%.0s' {1..41})"; do
+  no_curl "the label '${label}'" node-invite "$label" 10.0.0.5
+  check_contains "the label '${label}' is reported" "is not a label of a node" "$output"
+done
+for label in enroll invites relay verify; do
+  no_curl "the reserved label '${label}'" node-invite "$label" 10.0.0.5
+  check_contains "the reserved label '${label}' is reported" \
+    "The label '${label}' is reserved by STF (enroll, invites, relay, verify): choose another one." "$output"
+done
+no_curl "an invite of the loopback address" node-invite lab-1 127.0.0.1
+check_contains "a node on the server is invited with the LAN address" \
+  "A node on the MCloud server itself is invited with the LAN address of the server (README.md#devices-on-the-mcloud-server)" "$output"
+for address in 127.0.0.1 0.0.0.0 169.254.169.254 224.0.0.1 255.255.255.255 localhost a.localhost http://10.0.0.5 10.0.0.5:7000 \
+  10.0.0.256 "a b" 10.0.0.5/x; do
+  no_curl "the address '${address}'" node-invite lab-1 "$address"
+  check_contains "the address '${address}' is reported" "is not the address of a node" "$output"
+done
+for minutes in 0 1441 abc 10000 -5; do
+  no_curl "the validity '${minutes}'" node-invite lab-1 10.0.0.5 "$minutes"
+  check_contains "the validity '${minutes}' is reported" "is not a number of minutes from 1 to 1440" "$output"
+done
+api 201 "{\"invite\":\"${invite}\",\"label\":\"lab-1\",\"address\":\"10.0.0.5\",\"expiresAt\":\"2026-11-09T18:30:00.000Z\"}"
+reset_calls
+output="$(zbr "" node-invite lab-1 10.0.0.5 30)"
+check "an invite" "0" "$?"
+check "the invite is asked from the STF API through stf-proxy on the loopback address" \
+  "-sS|-k|--max-time|30|-X|POST|-H|Accept: application/json|-w|\\n%{http_code}|-K|-|-H|Content-Type: application/json|--data-binary|\
+{\"label\":\"lab-1\",\"address\":\"10.0.0.5\",\"ttlMinutes\":30}|https://127.0.0.1:443/api/v1/nodes/invites" "$(calls curl)"
+check "STF_TOKEN goes in the configuration of curl on its stdin" "header = \"Authorization: Bearer ${admin_token}\"" \
+  "$(cat "${WORK}/curl.stdin")"
+check_not_contains "STF_TOKEN is not an argument of curl" "$admin_token" "$(calls curl)"
+check_not_contains "STF_TOKEN is not shown" "$admin_token" "$output"
+check_contains "the join string: the host of STF_URL, STF_PORT, the label, the grid, the pin and the invite" \
+  $'\n'"mcloud-join://mcloud.example.com:443?label=lab-1&grid=mcloud.example.com:4446&pin=${pin_url}&token=${invite}"$'\n' "$output"
+check "the invite is shown once" "1" "$(grep -c "$invite" <<< "$output")"
+check "the pin is base64 of SHA-256" "yes" "$([[ "$pin" =~ ^[A-Za-z0-9+/]{43}=$ ]] && echo yes)"
+check "the pin is URL-safe in the join string" "" "$(grep -o 'pin=[^&]*' <<< "$output" | tr -d 'A-Za-z0-9%=' | sed 's/^pin//')"
+check_contains "the pin is shown" "(SHA-256 of its public key): ${pin}" "$output"
+check_contains "the invite is a secret for the join of the node" \
+  "It is a secret, shown once: paste it into ./zebrunner.sh join of mcloud-agent on the node lab-1" "$output"
+check_contains "the validity is shown" "valid 30 minutes (until 2026-11-09T18:30:00.000Z)" "$output"
+check "the join string is alone on stdout, the other lines go to stderr" \
+  "mcloud-join://mcloud.example.com:443?label=lab-1&grid=mcloud.example.com:4446&pin=${pin_url}&token=${invite}" \
+  "$(env -i HOME="${WORK}" PATH="${WORK}/bin:/usr/bin:/bin:/usr/sbin:/sbin" TERM=dumb STUB_DIR="$WORK" \
+    /bin/bash "${MCLOUD}/zebrunner.sh" node-invite lab-1 10.0.0.5 30 2> /dev/null)"
+reset_calls
+output="$(zbr "" node-invite lab-2 NODE-2.Example.COM)"
+check "the default validity is the one of STF, the address in lower case" \
+  "{\"label\":\"lab-2\",\"address\":\"node-2.example.com\"}" "$(calls curl | awk -F '|' '{print $(NF - 1)}')"
+check_contains "the default validity is shown" "valid 60 minutes" "$output"
+replace "${MCLOUD}/.env" "AGENTS_ADDRESS=0.0.0.0" "AGENTS_ADDRESS=10.0.0.2"
+check_contains "the host of the join string is AGENTS_ADDRESS when set" \
+  "mcloud-join://10.0.0.2:443?label=lab-1&grid=10.0.0.2:4446&pin=" "$(zbr "" node-invite lab-1 10.0.0.5)"
+replace "${MCLOUD}/.env" "AGENTS_ADDRESS=10.0.0.2" "AGENTS_ADDRESS=0.0.0.0"
+# openssl without x509 (or none): patch/spki_pin.py makes the pin
+stub openssl 'exit 1'
+output="$(zbr "" node-invite lab-1 10.0.0.5)"
+rm -f "${WORK}/bin/openssl"
+check_contains "python3 makes the same pin without openssl" "&pin=${pin_url}&token=" "$output"
+check "patch/spki_pin.py of an EC certificate is the pin of openssl" \
+  "$(openssl x509 -in "${REPO}/tests/fixtures/shared-ssl.crt" -noout -pubkey | openssl pkey -pubin -outform DER |
+    openssl dgst -sha256 -binary | openssl base64 -A)" "$(python3 "${REPO}/patch/spki_pin.py" "${REPO}/tests/fixtures/shared-ssl.crt")"
+api 201 '{"label":"lab-1"}'
+output="$(zbr "" node-invite lab-1 10.0.0.5)"
+check "an answer without an invite fails" "1" "$?"
+check_contains "an answer without an invite is reported" "answered the invite without one" "$output"
+for answer in "000:stf-proxy does not answer on 127.0.0.1:443: the services do not run or still start" \
+  "401:STF_TOKEN of variables.env is not a valid access token of STF (unknown to its database): sign in to STF as an admin, generate an access token" \
+  "403:refused: STF_TOKEN is not of an admin of STF" "400:refused: an unknown node" "404:not found: an unknown node" \
+  "500:the STF API answered 500 to STF_TOKEN of variables.env itself: the token was made with another SECRET" \
+  "502:stf-proxy answered 502, stf-api does not answer it" "418:the STF API answered 418, see docker logs stf-api"; do
+  api "${answer%%:*}" '{"success":false}'
+  output="$(zbr "" node-invite lab-1 10.0.0.5)"
+  check "the answer ${answer%%:*} fails" "1" "$?"
+  check_contains "the answer ${answer%%:*} is explained" "The invite of the node lab-1 failed: ${answer#*:}" "$output"
+  check_not_contains "the answer ${answer%%:*} shows no STF_TOKEN" "$admin_token" "$output"
+done
+api 500 '{"success":false}'
+reset_calls
+output="$(zbr "" node-invite lab-1 10.0.0.5)"
+check "a 500 is asked again of /api/v1/user" "https://127.0.0.1:443/api/v1/user" "$(calls curl | tail -1 | awk -F '|' '{print $NF}')"
+check_contains "a token of another SECRET: the volume of the database shared by the folders of the same name" \
+  "e.g. of another folder named nodes such as mcloud of Zebrunner CE: they share the docker volume nodes_stf-db-volume" "$output"
+printf 200 > "${WORK}/status.user"
+output="$(zbr "" node-invite lab-1 10.0.0.5)"
+rm -f "${WORK}/status.user"
+check_contains "a 500 of the operation with a valid token" \
+  "The invite of the node lab-1 failed: the STF API answered 500, see docker logs stf-api." "$output"
+check_not_contains "a 500 of the operation does not blame the token" "another SECRET" "$output"
+replace "${MCLOUD}/.env" "STF_URL=https://" "STF_URL=http://"
+no_curl "an invite of http" node-invite lab-1 10.0.0.5
+check_contains "an invite needs https" "The enrollment needs https of stf-proxy" "$output"
+replace "${MCLOUD}/.env" "STF_URL=http://" "STF_URL=https://"
+mv "${MCLOUD}/configuration/stf-proxy/ssl/ssl.crt" "${WORK}/nodes.crt"
+no_curl "an invite without the certificate" node-invite lab-1 10.0.0.5
+check_contains "an invite without the certificate names it" \
+  "The enrollment needs the certificate of stf-proxy, configuration/stf-proxy/ssl/ssl.crt is missing" "$output"
+mv "${WORK}/nodes.crt" "${MCLOUD}/configuration/stf-proxy/ssl/ssl.crt"
+
+key="$(printf 'ab%.0s' {1..32})"
+api 200 "{\"nodes\":[{\"label\":\"lab-1\",\"address\":\"10.0.0.5\",\"publicKey\":\"${key}\",\"status\":\"active\",
+  \"createdAt\":\"2026-11-09T17:00:00.000Z\",\"revokedAt\":null,\"lastSeenAt\":\"2026-11-09T17:30:00.123Z\"},
+  {\"label\":\"lab-2\",\"address\":\"node-2.lan\",\"publicKey\":\"${key//a/c}\",\"status\":\"revoked\",
+  \"createdAt\":\"2026-11-08T10:00:00.000Z\",\"revokedAt\":\"2026-11-09T09:00:00.000Z\",\"lastSeenAt\":null}]}"
+reset_calls
+output="$(zbr "" nodes)"
+check "the list of the nodes" "0" "$?"
+check "the list of the nodes is read from the STF API" \
+  "-sS|-k|--max-time|30|-X|GET|-H|Accept: application/json|-w|\\n%{http_code}|-K|-|https://127.0.0.1:443/api/v1/nodes" \
+  "$(calls curl)"
+check "a line per node" "LABEL ADDRESS STATUS LAST SEEN ENROLLED KEY
+lab-1 10.0.0.5 active 2026-11-09T17:30:00 2026-11-09T17:00:00 abababababababab...
+lab-2 node-2.lan revoked - 2026-11-08T10:00:00 cbcbcbcbcbcbcbcb..." "$(tr -s ' ' <<< "$output")"
+check "nodes list is the list" "$output" "$(zbr "" nodes list)"
+api 200 '{"nodes":[]}'
+check_contains "no node" "No node is enrolled" "$(zbr "" nodes list)"
+check "a list of nodes with an unknown subcommand" "1" "$(
+  zbr "" nodes other > /dev/null
+  echo "$?"
+)"
+
+api 200 '{"success":true}'
+reset_calls
+output="$(zbr "" nodes revoke lab-1)"
+check "a revocation" "0" "$?"
+check "the revocation is posted to the STF API" \
+  "-sS|-k|--max-time|30|-X|POST|-H|Accept: application/json|-w|\\n%{http_code}|-K|-|-H|Content-Type: application/json|\
+--data-binary|{}|https://127.0.0.1:443/api/v1/nodes/lab-1/revoke" "$(calls curl)"
+check "the revocation restarts the triproxies: the open ZeroMQ sessions end" "restart|stf-triproxy-app|stf-triproxy-dev" \
+  "$(calls docker)"
+check_contains "the revocation is reported" "The node lab-1 is revoked" "$output"
+api 404 '{"success":false}'
+reset_calls
+output="$(zbr "" nodes revoke lab-9)"
+check "the revocation of an unknown node fails" "1" "$?"
+check "no restart without a revocation" "" "$(calls docker)"
+no_curl "the revocation without a label" nodes revoke
+no_curl "the revocation of an invalid label" nodes revoke ../x
+api 204 ""
+reset_calls
+output="$(zbr "" nodes delete lab-2)"
+check "a removal" "0" "$?"
+check "the removal is a DELETE of the STF API" \
+  "-sS|-k|--max-time|30|-X|DELETE|-H|Accept: application/json|-w|\\n%{http_code}|-K|-|https://127.0.0.1:443/api/v1/nodes/lab-2" \
+  "$(calls curl)"
+check "the removal restarts nothing" "" "$(calls docker)"
+api 400 '{"success":false}'
+output="$(zbr "" nodes delete lab-1)"
+check "the removal of an active node fails" "1" "$?"
+check_contains "the removal needs a revocation" "a revoked one only: ./zebrunner.sh nodes revoke lab-1" "$output"
+
+# the diagnostics of a node: lab-1 at 10.0.0.5 with a reachable Android device, an iOS device stf-proxy does not reach
+# (its port in ${WORK}/unreachable), an absent device; the devices of another node and an unbound one are not shown
+api 200 "{\"nodes\":[{\"label\":\"lab-1\",\"address\":\"10.0.0.5\",\"publicKey\":\"${key}\",\"status\":\"active\",
+  \"createdAt\":\"2026-11-09T17:00:00.000Z\",\"revokedAt\":null,\"lastSeenAt\":\"2026-11-09T17:30:00.123Z\"},
+  {\"label\":\"lab-2\",\"address\":\"node-2.lan\",\"publicKey\":\"${key//a/c}\",\"status\":\"revoked\",
+  \"createdAt\":\"2026-11-08T10:00:00.000Z\",\"revokedAt\":\"2026-11-09T09:00:00.000Z\",\"lastSeenAt\":null},
+  {\"label\":\"lab-3\",\"address\":\"10.0.0.8\",\"publicKey\":\"${key}\",\"status\":\"active\",
+  \"createdAt\":\"2026-11-08T10:00:00.000Z\",\"revokedAt\":null,\"lastSeenAt\":null}]}"
+devices_answer='{"success":true,"description":"Devices Information","devices":[
+  {"serial":"emulator-5554","platform":"Android","present":true,"node":"lab-1","screenPort":7405,"connectPort":7406},
+  {"serial":"00008110-001","platform":"iOS","present":true,"node":"lab-1","screenPort":7600,"connectPort":null},
+  {"serial":"R58M","platform":"Android","present":false,"node":"lab-1","screenPort":7410,"connectPort":7411},
+  {"serial":"other","platform":"Android","present":true,"node":"lab-2","screenPort":7420,"connectPort":7421},
+  {"serial":"unbound","platform":"Android","present":true,"node":null,"screenPort":7430,"connectPort":7431}]}'
+printf '%s' "$devices_answer" > "${WORK}/answer.devices"
+echo 7600 > "${WORK}/unreachable"
+reset_calls
+output="$(zbr "" nodes check lab-1)"
+check "a node with an unreachable device fails the check" "1" "$?"
+check "the check reads the node and the devices from the STF API" \
+  "-sS|-k|--max-time|30|-X|GET|-H|Accept: application/json|-w|\\n%{http_code}|-K|-|https://127.0.0.1:443/api/v1/nodes
+-sS|-k|--max-time|30|-X|GET|-H|Accept: application/json|-w|\\n%{http_code}|-K|-|\
+https://127.0.0.1:443/api/v1/devices?fields=serial,platform,present,node,screenPort,connectPort" "$(calls curl)"
+check_not_contains "STF_TOKEN is not an argument of the check" "$admin_token" "$(calls curl)"
+# shellcheck disable=SC2016 # the script of the inner bash
+check "stf-proxy connects to the screens of the present devices of the node" \
+  'inspect|--format|{{.State.Running}}|stf-proxy
+exec|stf-proxy|timeout|5|bash|-c|echo > "/dev/tcp/$0/$1"|10.0.0.5|7405
+exec|stf-proxy|timeout|5|bash|-c|echo > "/dev/tcp/$0/$1"|10.0.0.5|7600' "$(calls docker)"
+check_contains "the record of the node" \
+  "Node lab-1: active, address 10.0.0.5, enrolled 2026-11-09T17:00:00, last seen by the grid 2026-11-09T17:30:00" "$output"
+check "the devices of the node with the result" "SERIAL PLATFORM PRESENT SCREEN REMOTE DEBUG SCREEN FROM stf-proxy
+emulator-5554 Android yes 7405 7406 reachable
+00008110-001 iOS yes 7600 - NOT REACHABLE
+R58M Android no 7410 7411 not checked: absent" "$(grep -E '^(SERIAL|emulator|00008110|R58M|other|unbound)' <<< "$output" | tr -s ' ')"
+check_contains "an unreachable screen fails" "   FAIL stf-proxy does not reach the screen of a device at 10.0.0.5" "$output"
+check_contains "an unreachable screen is explained" "The address of the invite must be the one the server reaches the node at" "$output"
+check_contains "the hint names the NAT hairpin" "NAT hairpin" "$output"
+check_contains "the record of an active node passes" "   ok   Node lab-1: active" "$output"
+check_contains "the devices bound to the node are counted" "   ok   Devices of STF bound to the node lab-1: 3" "$output"
+check "the summary of the checks" "2 ok, 0 warn, 1 fail" "$(tail -1 <<< "$output" | sed 's/^ *//')"
+: > "${WORK}/unreachable"
+output="$(zbr "" nodes check lab-1)"
+check "a node with its screens reachable passes the check" "0" "$?"
+check_not_contains "no hint when the screens are reachable" "does not reach" "$output"
+check_contains "the reachable screens pass" "   ok   stf-proxy reaches the screens of the present devices: 2" "$output"
+check "the summary of a node that passes" "3 ok, 0 warn, 0 fail" "$(tail -1 <<< "$output" | sed 's/^ *//')"
+touch "${WORK}/proxy-down"
+reset_calls
+output="$(zbr "" nodes check lab-1)"
+check "the check without stf-proxy fails" "1" "$?"
+rm -f "${WORK}/proxy-down"
+check_contains "stf-proxy that is not running is reported" "stf-proxy is not running (./zebrunner.sh start)" "$output"
+check "no connection without stf-proxy" "" "$(calls docker | grep '^exec')"
+output="$(zbr "" nodes check lab-2)"
+check "a revoked node fails the check" "1" "$?"
+check_contains "a revoked node is explained" "The node lab-2 is revoked" "$output"
+check_contains "a revoked node is invited again" "fix a new invite enrolls it again: ./zebrunner.sh node-invite lab-2 node-2.lan" "$output"
+output="$(zbr "" nodes check lab-9)"
+check "an unknown node fails the check" "1" "$?"
+check_contains "an unknown node is explained" "   FAIL There is no node lab-9 in the registry of STF" "$output"
+check_contains "the fix of an unknown node" "fix ./zebrunner.sh node-invite lab-9 <address>" "$output"
+output="$(zbr "" nodes check lab-3)"
+check "a node without devices fails the check" "1" "$?"
+check_contains "a node the grid has not seen is explained" "The grid has not seen the node yet" "$output"
+check_contains "a node without devices is explained" "No device of STF is bound to the node lab-3" "$output"
+no_curl "the check without a label" nodes check
+no_curl "the check of an invalid label" nodes check ../x
+rm -f "${WORK}/answer.devices"
+
+section "stf-proxy"
+conf="$(cat "${MCLOUD}/configuration/stf-proxy/nginx.conf")"
+# block <start>: the lines of a block of the nginx configuration from its first line to its end
+block() {
+  awk -v start="$1" 'index($0, start) { found = 1 } found { print } found && /^    }$/ { exit }' \
+    "${MCLOUD}/configuration/stf-proxy/nginx.conf"
+}
+screen="$(block 'location ~ "^/d/')"
+screen_auth="$(block "location = /_screen_auth")"
+check_not_contains "no list of the device hosts" "agent-hosts" "$conf"
+self="$(block "location ~* ^/api/v1/nodes/self")"
+check_contains "the record of a node for itself goes to stf-api" "set \$upstream_node_self stf-api:3000;" "$self"
+check_contains "the record of a node for itself is limited per address" \
+  "limit_req_zone \$binary_remote_addr zone=node_self:1m rate=30r/m;" "$conf"
+check_contains "too many requests of the record of a node are 429" "limit_req_status 429;" "$self"
+check_contains "the screens are allowed by stf-api" "auth_request /_screen_auth;" "$screen"
+check_contains "the node gets the headers of the WebSocket only" "proxy_pass_request_headers off;" "$screen"
+check_contains "the node gets no session cookie" 'proxy_set_header Cookie "";' "$screen"
+check_contains "the node gets no access token" 'proxy_set_header Authorization "";' "$screen"
+check_contains "the node gets no internal token" 'proxy_set_header X-Stf-Internal-Token "";' "$screen"
+check_contains "the node gets the screen ticket of stf-api" \
+  "auth_request_set \$screen_ticket \$upstream_http_x_mcloud_screen_ticket;" "$screen"
+check_contains "the screen ticket goes to the node" "proxy_set_header X-MCloud-Screen-Ticket \$screen_ticket;" "$screen"
+check_contains "the internal routes of the registry and the decision about the grid are refused" "return 403;" \
+  "$(block "location ~* ^/api/v1/zebrunner/(nodes|hub-auth) {")"
+check "the node gets no X-Stf-* header" "" "$(grep -i 'proxy_set_header *X-Stf' <<< "$screen" | grep -v ' "";$')"
+hub="$(block 'location  ~ ^/mcloud/wd/(.*)$ {')"
+check_contains "the hub is for the users of an access token" "auth_request /_hub_auth/hub;" "$hub"
+check_contains "the grid gets the secret of stf-proxy" "proxy_set_header        X-MCloud-Auth \$grid_auth_secret;" "$hub"
+check_contains "the grid gets no Authorization of the client" 'proxy_set_header        Authorization "";' "$hub"
+check_contains "the grid gets no Cookie of the client" 'proxy_set_header        Cookie "";' "$hub"
+for location in 'location ~ ^/mcloud/playwright/' 'location ~ ^/mcloud/grid/admin/TerminateSessionServlet' \
+  'location ~ ^/mcloud/grid/console' 'location ~ ^/mcloud/grid/admin/(?<grid_servlet>' 'location ~ ^/mcloud/grid/admin/MetricsServlet'; do
+  check_contains "${location} is for the users of STF" "auth_request /_hub_auth/" "$(block "$location")"
+  check_contains "${location}: the grid gets no Authorization of the client" 'Authorization "";' "$(block "$location")"
+done
+check_contains "the metrics are for an admin" "auth_request /_hub_auth/admin;" "$(block 'location ~ ^/mcloud/grid/admin/MetricsServlet')"
+check_contains "the other paths of the grid are not for the users" "return 404;" "$(block 'location /mcloud {')"
+check_contains "stf-api decides with the token and the cookie only" "proxy_pass_request_headers off;" "$(block 'location ~ ^/_hub_auth/')"
+check_contains "the decision of stf-api" "proxy_pass http://\$upstream_screen_auth/api/v1/zebrunner/screen-auth;" "$screen_auth"
+check_contains "stf-api gets the original URI" "proxy_set_header X-Original-URI \$request_uri;" "$screen_auth"
+check_contains "stf-api gets the session cookie" "proxy_set_header Cookie \$http_cookie;" "$screen_auth"
+check_contains "stf-api gets the access token" "proxy_set_header Authorization \$http_authorization;" "$screen_auth"
+check_contains "stf-api gets no other header of the user" "proxy_pass_request_headers off;" "$screen_auth"
+check_contains "the enrollment is limited per address" "limit_req_zone \$binary_remote_addr zone=node_enroll:1m rate=6r/m;" "$conf"
+enroll="$(block "location ~* ^/api/v1/nodes/enroll")"
+check_contains "the enrollment goes to stf-api" "set \$upstream_enroll stf-api:3000;" "$enroll"
+check_contains "the burst of the enrollment" "limit_req zone=node_enroll burst=3 nodelay;" "$enroll"
+check_contains "too many enrollments are 429" "limit_req_status 429;" "$enroll"
+MCLOUD="$ZBR_REPO"
+
+section "disabled"
+touch "${MCLOUD}/.disabled"
+reset_calls
+for command in start stop down backup restore version node-invite nodes; do
+  check "${command} does nothing when disabled" "0:" "$(
+    zbr "" "$command" > /dev/null
+    echo "$?:$(calls docker)"
+  )"
+done
+zbr "" shutdown > /dev/null
+check "shutdown of a disabled copy removes .disabled only" "no:yes" \
+  "$([[ -f "${MCLOUD}/.disabled" ]] && echo yes || echo no):$([[ -f "${MCLOUD}/.env" ]] && echo yes)"
+
+section "shutdown"
+# the backup of the settings (of the section backup and restore) and an archive of the database
+for file in variables.env .env backup/settings.env configuration/stf-proxy/nginx.conf; do
+  check "the backup ${file}.bak is there before the shutdown" "yes" "$([[ -f "${MCLOUD}/${file}.bak" ]] && echo yes)"
+done
+touch "${MCLOUD}/backup/rethinkdb.tar.gz"
+reset_calls
+zbr_env=(SHUTDOWN_CONFIRMED=1)
+output="$(zbr "" shutdown --help)"
+check "shutdown --help succeeds" "0" "$?"
+zbr "" shutdown -h > /dev/null
+zbr_env=()
+check "shutdown --help removes nothing, even confirmed" "yes:yes:" \
+  "$([[ -f "${MCLOUD}/.env" ]] && echo yes):$([[ -f "${MCLOUD}/variables.env" ]] && echo yes):$(docker_calls)"
+check_contains "shutdown --help explains the shutdown" "> ./zebrunner.sh shutdown" "$output"
+zbr "n\n" shutdown > /dev/null
+check "a declined shutdown keeps the settings" "yes:" "$([[ -f "${MCLOUD}/.env" ]] && echo yes):$(docker_calls)"
+zbr_env=(SHUTDOWN_CONFIRMED=1)
+zbr "" shutdown > /dev/null
+zbr_env=()
+check "shutdown removes the services and their volumes" "compose|--profile|adb-relay|--profile|mdm|down|-v" "$(docker_calls)"
+for file in .env variables.env grid.env backup/settings.env configuration/stf-proxy/nginx.conf configuration/adb-relay/stf-token \
+  configuration/stf-proxy/grid-auth.conf configuration/stf-proxy/nginx.conf.sha256; do
+  check "shutdown removes ${file}" "no" "$([[ -e "${MCLOUD}/${file}" ]] && echo yes || echo no)"
+done
+
+for file in variables.env.bak .env.bak backup/settings.env.bak configuration/stf-proxy/nginx.conf.bak \
+  configuration/stf-proxy/nginx.conf.sha256.bak; do
+  check "shutdown removes the backup ${file}" "no" "$([[ -e "${MCLOUD}/${file}" ]] && echo yes || echo no)"
+done
+check "shutdown keeps the certificate of the user" "yes" "$([[ -f "${SSL}/ssl.crt" && -f "${SSL}/ssl.key" ]] && echo yes)"
+check "shutdown keeps the copies of the certificate of the user" "yes" \
+  "$([[ -f "${SSL}/ssl.crt.bak" && -f "${SSL}/ssl.key.bak" ]] && echo yes)"
+check "shutdown keeps the archive of the database" "yes" "$([[ -f "${MCLOUD}/backup/rethinkdb.tar.gz" ]] && echo yes)"
+check_contains "shutdown without settings" "Unable to erase as nothing is configured!" "$(zbr "" shutdown)"
+
+finish
