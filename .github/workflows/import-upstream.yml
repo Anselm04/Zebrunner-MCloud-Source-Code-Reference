@@ -1,0 +1,66 @@
+name: Import Zebrunner MCloud reference
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/import-upstream.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: reference-import
+  cancel-in-progress: false
+jobs:
+  import:
+    if: github.repository == 'Anselm04/Zebrunner-MCloud-Source-Code-Reference' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Import and verify pinned upstream files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git init "$RUNNER_TEMP/upstream"
+          git -C "$RUNNER_TEMP/upstream" remote add origin https://github.com/zebrunner/mcloud.git
+          git -C "$RUNNER_TEMP/upstream" fetch --depth=1 origin 3f94a710724bcb483e85261a3e389ecadbeb0c11
+          git -C "$RUNNER_TEMP/upstream" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/upstream" rev-parse HEAD)" = "3f94a710724bcb483e85261a3e389ecadbeb0c11"
+          python3 - <<'PY'
+          import os,pathlib,subprocess,hashlib
+          src=pathlib.Path(os.environ['RUNNER_TEMP'])/'upstream'
+          dst=pathlib.Path.cwd()
+          rows=subprocess.check_output(['git','-C',str(src),'ls-files','--stage','-z']).decode().split('\0')
+          copied,excluded=[],[]
+          for row in filter(None,rows):
+              attrs,name=row.split('\t',1)
+              mode,expected,stage=attrs.split()
+              if name.startswith('.github/workflows/') or name in ('.github/dependabot.yml','.github/dependabot.yaml') or mode not in ('100644','100755'):
+                  excluded.append(name); continue
+              p=src/name
+              if not p.is_file() or p.is_symlink() or p.stat().st_size>=100*1024*1024:
+                  excluded.append(name); continue
+              data=subprocess.check_output(['git','-C',str(src),'cat-file','blob',expected])
+              actual=hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+              if actual!=expected: raise RuntimeError(name)
+              target=dst/name
+              target.parent.mkdir(parents=True,exist_ok=True)
+              target.write_bytes(data)
+              target.chmod(0o755 if mode=='100755' else 0o644)
+              subprocess.run(['git','add','-f','--',name],check=True)
+              copied.append(expected+'  '+name)
+          assert copied and (dst/'LICENSE').is_file()
+          meta=dst/'.trillionai-reference'
+          meta.mkdir(exist_ok=True)
+          (meta/'SOURCE.txt').write_text('Upstream: https://github.com/zebrunner/mcloud\nRevision: 3f94a710724bcb483e85261a3e389ecadbeb0c11\nCopied files: '+str(len(copied))+'\nExcluded files: '+str(len(excluded))+'\nUpstream automation and unsupported entries excluded; original licences retained.\n')
+          (meta/'FILES.txt').write_text('\n'.join(copied)+'\n')
+          (meta/'EXCLUDED.txt').write_text('\n'.join(excluded)+'\n')
+          PY
+          git add -f .trillionai-reference
+          git -c core.autocrlf=false diff --cached --stat >/dev/null
+          git diff --cached --quiet && exit 0
+          git commit -m "Import verified Zebrunner MCloud upstream source"
+          git push origin HEAD:main
